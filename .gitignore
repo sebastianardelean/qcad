@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Shadow CLJS build output and caches
+public/js/
+out/
+.shadow-cljs/
+.cpcache/
+
+# electron-builder output
+dist/
+
+# Test coverage output
+coverage/
+.c8tmp/
+.c8report.txt
+.c8app.txt
+
+# REPL / tooling ports
+.nrepl-port
+.cljs_repl_port
+.cef.log
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editors / IDE
+.idea/
+*.iml
+.vscode/

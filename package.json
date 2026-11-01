@@ -1,0 +1,20 @@
+{
+    "name": "qcad",
+    "version": "1.0.0",
+    "private": true,
+    "main": "main.cjs",
+    "description": "",
+    "scripts": {
+        "start": "electron .",
+        "build:cljs": "shadow-cljs release app",
+        "watch:cljs": "shadow-cljs watch app"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "type": "commonjs",
+    "devDependencies": {
+        "electron": "^45.2.1",
+        "shadow-cljs": "^3.5.8"
+    }
+}

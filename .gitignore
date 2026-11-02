@@ -3,6 +3,7 @@ node_modules/
 
 # Shadow CLJS build output and caches
 public/js/
+target/
 out/
 .shadow-cljs/
 .cpcache/

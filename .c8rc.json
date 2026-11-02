@@ -1,0 +1,11 @@
+{
+  "include": ["**/cljs-runtime/app.*.js"],
+  "exclude": ["**/*_test.js"],
+  "reporter": ["text", "html", "json-summary"],
+  "reports-dir": "coverage",
+  "check-coverage": true,
+  "lines": 90,
+  "statements": 90,
+  "functions": 90,
+  "branches": 60
+}

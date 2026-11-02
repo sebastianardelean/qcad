@@ -1,15 +1,15 @@
-
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ClojureScript + Electron</title>
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;">
+  <title>QCAD</title>
+  <link rel="stylesheet" href="./public/css/app.css">
 </head>
 <body>
-  <h1>My ClojureScript application</h1>
-  <button id="greet-button">Say hello</button>
-  <p id="output">Click the button to begin.</p>
+  <div id="app"></div>
   <script src="./public/js/main.js"></script>
 </body>
 </html>

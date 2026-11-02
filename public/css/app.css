@@ -330,3 +330,45 @@ body {
 .dialog-actions button:hover {
   filter: brightness(0.95);
 }
+
+.dialog-help {
+  margin: 0 0 4px;
+  color: #52606d;
+  font-size: 13px;
+}
+
+.gate-target-registers {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.gate-target-register {
+  margin: 0;
+  padding: 8px 10px 4px;
+  border: 1px solid #d9e2ec;
+  border-radius: 6px;
+}
+
+.gate-target-register legend {
+  padding: 0 4px;
+  color: #334e68;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.gate-target-qubit {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+  font-weight: 400;
+}
+
+.dialog .gate-target-qubit input {
+  width: auto;
+  margin: 0;
+  padding: 0;
+}

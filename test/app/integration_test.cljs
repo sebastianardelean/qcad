@@ -29,6 +29,13 @@
 (defn- reset-app! []
   (stop-app!)
   (set! (.-innerHTML (.-body (document))) "<div id=\"app\"></div>")
+  (set! (.-electronAPI js/window) nil)
+  (reset! session (core/init!)))
+
+(defn- reset-app-with-api! [api]
+  (stop-app!)
+  (set! (.-innerHTML (.-body (document))) "<div id=\"app\"></div>")
+  (set! (.-electronAPI js/window) api)
   (reset! session (core/init!)))
 
 (use-fixtures :each (fn [test-fn]
@@ -676,3 +683,134 @@
     (key-down! "Escape")
     (is (nil? (select "#canvas-marquee")))
     (is (= 0 (count (select-all ".canvas-item.selected"))))))
+
+(defn- save-api
+  [calls callbacks unsubscribed]
+  #js {:ping (fn [] (js/Promise.resolve "pong"))
+       :saveQasm (fn [content suggested-name]
+                   (swap! calls conj [content suggested-name])
+                   (js/Promise.resolve #js {:canceled false :filePath "circuit.qasm"}))
+       :onMenuSave (fn [callback]
+                     (swap! callbacks conj callback)
+                     (fn [] (swap! unsubscribed inc)))})
+
+(deftest save-qasm-menu-test
+  (testing "the File Save menu saves the drawn circuit without a toolbar button"
+    (let [calls (atom [])
+          callbacks (atom [])
+          unsubscribed (atom 0)]
+      (reset-app-with-api! (save-api calls callbacks unsubscribed))
+      (is (nil? (select "#save-qasm")))
+      (is (= 1 (count @callbacks)))
+      (drop-component! :quantum-register 40 40)
+      (submit-register! "data" "2")
+      (drop-component! :h 200 40)
+      (draw-wire! 1 2 40 40 200 40)
+      ((first @callbacks))
+      (is (= 1 (count @calls)))
+      (let [[content suggested-name] (first @calls)]
+        (is (= "circuit.qasm" suggested-name))
+        (is (str/includes? content "qubit[2] data;"))
+        (is (str/includes? content "h data;")))
+      (stop-app!)
+      (is (= 1 @unsubscribed)))))
+
+(defn- double-click! [target]
+  (.dispatchEvent target (mouse-event "dblclick" {})))
+
+(defn- submit-gate-targets! []
+  (.dispatchEvent (select "#gate-target-form")
+                  (js/window.Event. "submit" #js {:bubbles true :cancelable true})))
+
+(defn- checked-qubits []
+  (->> (select-all "[data-qubit-index]")
+       (filter #(.-checked %))
+       (mapv (fn [input]
+               [(js/parseInt (.getAttribute input "data-register-id") 10)
+                (js/parseInt (.getAttribute input "data-qubit-index") 10)]))))
+
+(deftest gate-target-dialog-test
+  (testing "double clicking a wired gate selects qubits from its register"
+    (let [calls (atom [])
+          callbacks (atom [])
+          unsubscribed (atom 0)]
+      (reset-app-with-api! (save-api calls callbacks unsubscribed))
+      (drop-component! :quantum-register 40 40)
+      (submit-register! "data" "3")
+      (drop-component! :h 200 40)
+      (draw-wire! 1 2 40 40 200 40)
+      (toggle-wire-tool!)
+      (double-click! (select "[data-item-id=\"2\"]"))
+      (is (some? (select "#gate-target-form")))
+      (is (= ["0" "1" "2"]
+             (mapv #(.getAttribute % "data-qubit-index")
+                   (select-all "[data-qubit-index]"))))
+      (is (= [[1 0] [1 1] [1 2]] (checked-qubits)))
+      (set! (.-checked (select "[data-qubit-index=\"1\"]")) false)
+      (submit-gate-targets!)
+      (is (nil? (select "#gate-target-form")))
+      ((first @callbacks))
+      (let [[content] (first @calls)]
+        (is (str/includes? content "h data[0];"))
+        (is (str/includes? content "h data[2];"))
+        (is (not (str/includes? content "h data[1];")))))))
+
+(deftest gate-multi-register-target-test
+  (testing "a gate can target qubits from more than one register"
+    (let [calls (atom [])
+          callbacks (atom [])
+          unsubscribed (atom 0)]
+      (reset-app-with-api! (save-api calls callbacks unsubscribed))
+      (drop-component! :quantum-register 40 40)
+      (submit-register! "a" "2")
+      (drop-component! :quantum-register 40 140)
+      (submit-register! "b" "2")
+      (drop-component! :h 240 40)
+      (toggle-wire-tool!)
+      (doseq [[from-id to-id from-x from-y to-x to-y]
+              [[1 3 40 40 240 40]
+               [2 3 40 140 240 40]]]
+        (mouse-down! (select (str "[data-item-id=\"" from-id "\"]"))
+                     {:clientX from-x :clientY from-y})
+        (mouse-move! {:clientX to-x :clientY to-y})
+        (mouse-up-on! (select (str "[data-item-id=\"" to-id "\"]"))
+                      {:clientX to-x :clientY to-y}))
+      (toggle-wire-tool!)
+      (double-click! (select "[data-item-id=\"3\"]"))
+      (doseq [input (select-all "[data-qubit-index]")]
+        (set! (.-checked input) false))
+      (set! (.-checked (select "[data-register-id=\"1\"][data-qubit-index=\"1\"]")) true)
+      (set! (.-checked (select "[data-register-id=\"2\"][data-qubit-index=\"0\"]")) true)
+      (submit-gate-targets!)
+      ((first @callbacks))
+      (let [[content] (first @calls)]
+        (is (str/includes? content "h a[1];"))
+        (is (str/includes? content "h b[0];"))))))
+
+(deftest gate-target-dialog-validation-test
+  (testing "unconnected gates do not open the target dialog"
+    (drop-component! :h 100 100)
+    (double-click! (select "[data-item-id=\"1\"]"))
+    (is (nil? (select "#gate-target-form"))))
+
+  (testing "submitting no qubits keeps the dialog open with an error"
+    (reset-app!)
+    (drop-component! :quantum-register 40 40)
+    (submit-register! "data" "2")
+    (drop-component! :h 200 40)
+    (draw-wire! 1 2 40 40 200 40)
+    (toggle-wire-tool!)
+    (double-click! (select "[data-item-id=\"2\"]"))
+    (doseq [input (select-all "[data-qubit-index]")]
+      (set! (.-checked input) false))
+    (submit-gate-targets!)
+    (is (some? (select "#gate-target-form")))
+    (is (= "Select at least one qubit." (.-textContent (select ".dialog-error"))))))
+
+(deftest selection-mousedown-test
+  (testing "selecting an item updates classes without replacing its node"
+    (drop-component! :h 100 100)
+    (let [node (select "[data-item-id=\"1\"]")]
+      (mouse-down! node {:clientX 100 :clientY 100})
+      (is (identical? node (select "[data-item-id=\"1\"]")))
+      (is (.contains (.-classList node) "selected")))))

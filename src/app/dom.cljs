@@ -257,47 +257,102 @@
            :text (str/join " " (vals errors))
            :attrs {:role "alert"}}))
 
-(defn render-dialog [dialog]
-  (when dialog
-    (let [name-input (el "input" {:attrs {:id "register-name"
-                                          :name "name"
-                                          :type "text"
-                                          :autocomplete "off"}})
-          qubits-input (el "input" {:attrs {:id "register-qubits"
-                                            :name "qubits"
-                                            :type "number"
-                                            :min "1"
-                                            :step "1"}})
-          actions (append! (el "div" {:class "dialog-actions"})
-                           [(el "button" {:class "button-primary"
-                                          :text "Add register"
-                                          :attrs {:type "submit"
-                                                  :id "register-confirm"}})
-                            (el "button" {:text "Cancel"
-                                          :attrs {:type "button"
-                                                  :id "register-cancel"}})])
-          form (append! (el "form" {:attrs {:id "register-form"
-                                            :novalidate "novalidate"}})
-                        [(el "h2" {:class "dialog-title"
-                                   :text "Configure quantum register"
-                                   :attrs {:id "register-dialog-title"}})
-                         (el "label" {:text "Name"
-                                      :attrs {:for "register-name"}})
-                         name-input
-                         (el "label" {:text "Number of qubits"
-                                      :attrs {:for "register-qubits"}})
-                         qubits-input
-                         (when-let [errors (:error dialog)]
-                           (render-error errors))
-                         actions])]
-      (set! (.-value name-input) (:name dialog))
-      (set! (.-value qubits-input) (:qubits dialog))
-      (append! (el "div" {:class "dialog-backdrop"})
-               [(append! (el "div" {:class "dialog"
-                                    :attrs {:role "dialog"
-                                            :aria-modal "true"
-                                            :aria-labelledby "register-dialog-title"}})
-                         [form])]))))
+(defn- dialog-backdrop [title-id form]
+  (append! (el "div" {:class "dialog-backdrop"})
+           [(append! (el "div" {:class "dialog"
+                                :attrs {:role "dialog"
+                                        :aria-modal "true"
+                                        :aria-labelledby title-id}})
+                     [form])]))
+
+(defn- render-register-dialog [dialog]
+  (let [name-input (el "input" {:attrs {:id "register-name"
+                                        :name "name"
+                                        :type "text"
+                                        :autocomplete "off"}})
+        qubits-input (el "input" {:attrs {:id "register-qubits"
+                                          :name "qubits"
+                                          :type "number"
+                                          :min "1"
+                                          :step "1"}})
+        actions (append! (el "div" {:class "dialog-actions"})
+                         [(el "button" {:class "button-primary"
+                                        :text "Add register"
+                                        :attrs {:type "submit"
+                                                :id "register-confirm"}})
+                          (el "button" {:text "Cancel"
+                                        :attrs {:type "button"
+                                                :id "register-cancel"}})])
+        form (append! (el "form" {:attrs {:id "register-form"
+                                          :novalidate "novalidate"}})
+                      [(el "h2" {:class "dialog-title"
+                                 :text "Configure quantum register"
+                                 :attrs {:id "register-dialog-title"}})
+                       (el "label" {:text "Name"
+                                    :attrs {:for "register-name"}})
+                       name-input
+                       (el "label" {:text "Number of qubits"
+                                    :attrs {:for "register-qubits"}})
+                       qubits-input
+                       (when-let [errors (:error dialog)]
+                         (render-error errors))
+                       actions])]
+    (set! (.-value name-input) (:name dialog))
+    (set! (.-value qubits-input) (:qubits dialog))
+    (dialog-backdrop "register-dialog-title" form)))
+
+(defn- gate-target-checkbox [dialog register qubit]
+  (let [input (el "input" {:attrs {:type "checkbox"
+                                   :data-register-id (:id register)
+                                   :data-qubit-index qubit}})
+        label (append! (el "label" {:class "gate-target-qubit"})
+                       [input
+                        (.createTextNode js/document
+                                         (str (:name register) "[" qubit "]"))])]
+    (set! (.-checked input)
+          (contains? (:selected dialog) [(:id register) qubit]))
+    label))
+
+(defn- render-gate-target-dialog [state dialog]
+  (let [gate (model/item-by-id state (:gate-id dialog))
+        registers (model/connected-registers state (:gate-id dialog))
+        gate-label (or (:label (components/by-id (:component gate)))
+                       (some-> (:component gate) name)
+                       "gate")
+        registers-node (append! (el "div" {:class "gate-target-registers"})
+                                (for [register registers]
+                                  (append! (el "fieldset" {:class "gate-target-register"})
+                                           [(el "legend" {:text (:name register)})
+                                            (map #(gate-target-checkbox dialog register %)
+                                                 (range (:qubits register)))])))
+        actions (append! (el "div" {:class "dialog-actions"})
+                         [(el "button" {:class "button-primary"
+                                        :text "Apply"
+                                        :attrs {:type "submit"
+                                                :id "gate-target-confirm"}})
+                          (el "button" {:text "Cancel"
+                                        :attrs {:type "button"
+                                                :id "gate-target-cancel"}})])
+        form (append! (el "form" {:attrs {:id "gate-target-form"
+                                          :novalidate "novalidate"}})
+                      [(el "h2" {:class "dialog-title"
+                                 :text (str "Select " gate-label " gate targets")
+                                 :attrs {:id "gate-target-dialog-title"}})
+                       (el "p" {:class "dialog-help"
+                                :text "Choose the qubits this gate acts on."})
+                       registers-node
+                       (when-let [error (:error dialog)]
+                         (el "p" {:class "dialog-error"
+                                  :text error
+                                  :attrs {:role "alert"}}))
+                       actions])]
+    (dialog-backdrop "gate-target-dialog-title" form)))
+
+(defn render-dialog [state]
+  (when-let [dialog (:dialog state)]
+    (if (= :gate-targets (:type dialog))
+      (render-gate-target-dialog state dialog)
+      (render-register-dialog dialog))))
 
 (defn render-app [state]
   (append! (el "div" {:class "app"
@@ -306,4 +361,4 @@
            [(render-components-panel)
             (render-canvas state)
             (render-context-menu (:context-menu state))
-            (render-dialog (:dialog state))]))
+            (render-dialog state)]))

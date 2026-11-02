@@ -35,4 +35,10 @@
 19. ~~What is the use of snap on button? It doesn't work.~~
 20. ~~Popup window when adding an register doesn't accept input.~~
 21. ~~When in wire mode, click on a component to start a wire. If left mouse button is clicked again, the wire will snap to that location, being afterwards available to go up, down with the wire until the end component.~~
-
+22. ~~Add a button (File -> Save)~~
+23. ~~In project root resources/ there are the lexer and parser grammars for openqasm3.0. Save the drawn circuit as openqasm code.~~
+24. ~~Remove Save QASM button~~
+25. ~~add option to double click on each component (gate) connected to a register to specify on which qubits the gate is applied. It can be applied on multiple qubits in same register on multiple qubits in 1 or more registers.~~
+25. For each single qubit gate, add in symbol a input and output port. 
+26. If the gate will be applied on multiple qubits, when double clicking the gate, input the number of qubits. The change shall be reflected on the gate symbol, having multiple inputs and outputs.
+27. For registers, add on the symbol on canvas, an output port for each qubit. If there are multiple qubits, then multiple ports.

@@ -556,3 +556,73 @@
   (testing "selection is untouched without a marquee"
     (let [state (model/select-item model/initial-state 1)]
       (is (= state (model/update-marquee-selection state []))))))
+
+(defn- target-circuit []
+  {:items [{:id 1 :type :register :name "a" :qubits 2 :x 0 :y 0}
+           {:id 2 :type :register :name "b" :qubits 3 :x 0 :y 100}
+           {:id 3 :type :gate :component :h :x 100 :y 0}
+           {:id 4 :type :gate :component :x :x 200 :y 0}]
+   :wires [{:id 1 :from 1 :to 3}
+           {:id 2 :from 2 :to 3}
+           {:id 3 :from 3 :to 4}]})
+
+(deftest connected-registers-test
+  (testing "registers connected through gates and wires are found"
+    (is (= [1 2] (mapv :id (model/connected-registers (target-circuit) 4))))
+    (is (= [1 2] (mapv :id (model/connected-registers (target-circuit) 3)))))
+
+  (testing "unconnected gates have no registers"
+    (is (= [] (model/connected-registers (target-circuit) 99)))))
+
+(deftest open-gate-target-dialog-test
+  (testing "the dialog defaults to every qubit of every connected register"
+    (let [state (model/open-gate-target-dialog (target-circuit) 3)]
+      (is (= {:type :gate-targets
+              :gate-id 3
+              :selected #{[1 0] [1 1] [2 0] [2 1] [2 2]}
+              :error nil}
+             (:dialog state)))
+      (is (nil? (:context-menu state)))))
+
+  (testing "existing targets seed the dialog"
+    (let [state (-> (target-circuit)
+                    (assoc-in [:items 2 :targets] {1 #{1} 2 #{0 2}})
+                    (model/open-gate-target-dialog 3))]
+      (is (= #{[1 1] [2 0] [2 2]} (get-in state [:dialog :selected])))))
+
+  (testing "only gates with connected registers open the dialog"
+    (is (= (target-circuit) (model/open-gate-target-dialog (target-circuit) 1)))
+    (is (= (target-circuit) (model/open-gate-target-dialog (target-circuit) 99)))))
+
+(deftest confirm-gate-targets-test
+  (testing "selected qubits are stored on the gate"
+    (let [state (-> (target-circuit)
+                    (model/open-gate-target-dialog 3)
+                    (model/confirm-gate-targets #{[1 1] [2 0] [2 2]}))]
+      (is (nil? (:dialog state)))
+      (is (= {1 #{1} 2 #{0 2}} (get-in state [:items 2 :targets])))
+      (is (nil? (get-in state [:items 3 :targets])))))
+
+  (testing "invalid or unconnected selections are ignored"
+    (let [state (-> (target-circuit)
+                    (model/open-gate-target-dialog 3)
+                    (model/confirm-gate-targets #{[1 5] [2 1] [99 0]}))]
+      (is (= {2 #{1}} (get-in state [:items 2 :targets])))))
+
+  (testing "an empty selection keeps the dialog open with an error"
+    (let [state (-> (target-circuit)
+                    (model/open-gate-target-dialog 3)
+                    (model/confirm-gate-targets #{}))]
+      (is (= "Select at least one qubit." (get-in state [:dialog :error])))
+      (is (nil? (get-in state [:items 2 :targets])))))
+
+  (testing "confirming without a target dialog is a no-op"
+    (let [state (assoc model/initial-state :dialog {:name "q"})]
+      (is (= state (model/confirm-gate-targets state #{[1 0]}))))))
+
+(deftest cancel-dialog-test
+  (testing "cancel clears register and gate target dialogs"
+    (let [register-state (assoc model/initial-state :dialog {:name "q"})
+          gate-state (model/open-gate-target-dialog (target-circuit) 3)]
+      (is (nil? (:dialog (model/cancel-dialog register-state))))
+      (is (nil? (:dialog (model/cancel-dialog gate-state)))))))

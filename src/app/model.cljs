@@ -166,6 +166,35 @@
 (defn item-by-id [state item-id]
   (first (filter #(= item-id (:id %)) (:items state))))
 
+(defn- item-adjacency [state]
+  (let [ids (into #{} (map :id (:items state)))]
+    (reduce (fn [adj {:keys [from to]}]
+              (if (and (contains? ids from) (contains? ids to))
+                (-> adj
+                    (update from (fnil conj #{}) to)
+                    (update to (fnil conj #{}) from))
+                adj))
+            {}
+            (:wires state))))
+
+(defn- reachable-item-ids [state item-id]
+  (let [adjacency (item-adjacency state)]
+    (loop [visited #{} queue [item-id]]
+      (if-let [id (peek queue)]
+        (if (contains? visited id)
+          (recur visited (pop queue))
+          (recur (conj visited id)
+                 (into (pop queue) (get adjacency id))))
+        visited))))
+
+(defn connected-registers [state item-id]
+  (let [reachable (reachable-item-ids state item-id)]
+    (->> (:items state)
+         (filter #(and (= :register (:type %))
+                       (contains? reachable (:id %))))
+         (sort-by (juxt #(or (:y %) 0) #(or (:x %) 0) #(or (:id %) 0)))
+         vec)))
+
 (defn delete-items [state item-ids]
   (let [item-ids (set item-ids)
         draft (:wire-draft state)]
@@ -309,6 +338,63 @@
                   :error nil}
          :context-menu nil))
 
+(defn- target-pairs [targets]
+  (set (for [[register-id qubits] targets
+             qubit qubits]
+         [register-id qubit])))
+
+(defn- gate-target-selection [state gate]
+  (if (some? (:targets gate))
+    (target-pairs (:targets gate))
+    (set (for [register (connected-registers state (:id gate))
+               qubit (range (:qubits register))]
+           [(:id register) qubit]))))
+
+(defn open-gate-target-dialog [state gate-id]
+  (if-let [gate (item-by-id state gate-id)]
+    (if (and (= :gate (:type gate))
+             (seq (connected-registers state gate-id)))
+      (assoc state
+             :dialog {:type :gate-targets
+                      :gate-id gate-id
+                      :selected (gate-target-selection state gate)
+                      :error nil}
+             :context-menu nil)
+      state)
+    state))
+
+(defn- valid-target? [state connected-ids [register-id qubit]]
+  (and (contains? connected-ids register-id)
+       (when-let [register (item-by-id state register-id)]
+         (and (= :register (:type register))
+              (integer? qubit)
+              (<= 0 qubit)
+              (< qubit (:qubits register))))))
+
+(defn confirm-gate-targets [state selected]
+  (if-let [dialog (:dialog state)]
+    (if (= :gate-targets (:type dialog))
+      (let [connected-ids (into #{} (map :id) (connected-registers state (:gate-id dialog)))
+            targets (->> selected
+                         (filter #(valid-target? state connected-ids %))
+                         (group-by first)
+                         (map (fn [[register-id pairs]]
+                                [register-id (set (map second pairs))]))
+                         (into {}))]
+        (if (empty? targets)
+          (assoc-in state [:dialog :error] "Select at least one qubit.")
+          (-> state
+              (update :items
+                      (fn [items]
+                        (mapv (fn [item]
+                                (if (= (:id item) (:gate-id dialog))
+                                  (assoc item :targets targets)
+                                  item))
+                              items)))
+              (assoc :dialog nil))))
+      state)
+    state))
+
 (defn handle-drop [state component-id x y]
   (if-let [component (components/by-id component-id)]
     (let [[x y] (snap-point state [x y])]
@@ -337,7 +423,10 @@
             (assoc :dialog nil))))
     state))
 
-(defn cancel-register [state]
+(defn cancel-dialog [state]
   (if (:dialog state)
     (assoc state :dialog nil)
     state))
+
+(defn cancel-register [state]
+  (cancel-dialog state))

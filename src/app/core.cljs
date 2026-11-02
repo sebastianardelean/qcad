@@ -1,10 +1,24 @@
 (ns app.core
   (:require [app.dom :as dom]
-            [app.model :as model]))
+            [app.model :as model]
+            [app.qasm :as qasm]))
 
 (defn- render! [root state]
   (set! (.-innerHTML root) "")
   (.appendChild root (dom/render-app state)))
+
+(defn- save-qasm! [state]
+  (let [api (.-electronAPI js/window)]
+    (if-let [save (and api (.-saveQasm api))]
+      (.catch (.saveQasm api (qasm/to-qasm @state) "circuit.qasm")
+              (fn [error]
+                (js/console.error "Could not save OpenQASM." error)))
+      (js/console.warn "Saving requires the Electron application."))))
+
+(defn- subscribe-menu-save! [state]
+  (when-let [api (.-electronAPI js/window)]
+    (when-let [on-menu-save (.-onMenuSave api)]
+      (on-menu-save #(save-qasm! state)))))
 
 (defn- closest [event selector]
   (some-> (.-target event) (.closest selector)))
@@ -50,13 +64,30 @@
         (swap! state model/handle-drop component-id x y)
         (render! root @state)))))
 
+(defn- checked-targets [form]
+  (->> (array-seq (.querySelectorAll form "input[data-qubit-index]"))
+       (filter #(.-checked %))
+       (map (fn [input]
+              [(js/parseInt (.getAttribute input "data-register-id") 10)
+               (js/parseInt (.getAttribute input "data-qubit-index") 10)]))
+       set))
+
 (defn- handle-submit! [state root event]
-  (when-let [form (closest event "#register-form")]
+  (when-let [form (closest event "form")]
     (.preventDefault event)
-    (let [name (.-value (.querySelector form "#register-name"))
-          qubits (.-value (.querySelector form "#register-qubits"))]
-      (swap! state model/confirm-register name qubits)
-      (render! root @state))))
+    (case (.-id form)
+      "register-form"
+      (let [name (.-value (.querySelector form "#register-name"))
+            qubits (.-value (.querySelector form "#register-qubits"))]
+        (swap! state model/confirm-register name qubits)
+        (render! root @state))
+
+      "gate-target-form"
+      (do
+        (swap! state model/confirm-gate-targets (checked-targets form))
+        (render! root @state))
+
+      nil)))
 
 (defn- item-id [event]
   (some-> (closest event "[data-item-id]")
@@ -80,54 +111,69 @@
               item))
           (:items state))))
 
+(defn- sync-selection! [root state]
+  (doseq [node (array-seq (.querySelectorAll root ".canvas-item"))]
+    (when-let [id (some-> (.getAttribute node "data-item-id")
+                          (js/parseInt 10))]
+      (if (contains? (:selected state) id)
+        (.add (.-classList node) "selected")
+        (.remove (.-classList node) "selected")))))
+
 (defn- handle-mousedown! [state root drag event]
   (let [button (.-button event)]
     (when (and (or (zero? button) (= 1 button))
                (not (closest event ".context-menu"))
                (not (closest event ".dialog-backdrop"))
                (not (closest event ".canvas-toolbar")))
-      (reset! drag nil)
-      (cond
-        (= 1 button)
-        (do
-          (.preventDefault event)
-          (reset! drag {:mode :pan
-                        :start [(.-clientX event) (.-clientY event)]}))
-
-        (model/wire-tool? @state)
-        (if-let [id (item-id event)]
-          (when-let [p (world-point state root event)]
-            (.preventDefault event)
-            (when-not (:wire-draft @state)
-              (swap! state model/start-wire-draft id (first p) (second p))))
-          (when (:wire-draft @state)
-            (.preventDefault event)))
-
-        :else
-        (if-let [id (item-id event)]
+      (let [had-context-menu? (some? (:context-menu @state))
+            clicked-id (item-id event)]
+        (reset! drag nil)
+        (cond
+          (= 1 button)
           (do
-            (swap! state
-                   (fn [s]
-                     (-> (if (.-shiftKey event)
-                           (model/toggle-selection s id)
-                           (if (contains? (:selected s) id)
-                             s
-                             (model/select-item s id)))
-                         model/close-context-menu)))
-            (when-not (.-shiftKey event)
-              (reset! drag {:mode :move
-                            :origins (into {}
-                                           (comp (filter #(contains? (:selected @state)
-                                                                     (:id %)))
-                                                 (map (juxt :id (juxt :x :y))))
-                                           (:items @state))
-                            :start [(.-clientX event) (.-clientY event)]})))
-          (when-let [p (world-point state root event)]
-            (swap! state #(-> %
-                              model/clear-selection
-                              model/close-context-menu
-                              (model/begin-marquee p))))))
-      (render! root @state))))
+            (.preventDefault event)
+            (reset! drag {:mode :pan
+                          :start [(.-clientX event) (.-clientY event)]}))
+
+          (model/wire-tool? @state)
+          (if clicked-id
+            (when-let [p (world-point state root event)]
+              (.preventDefault event)
+              (when-not (:wire-draft @state)
+                (swap! state model/start-wire-draft clicked-id (first p) (second p))))
+            (when (:wire-draft @state)
+              (.preventDefault event)))
+
+          :else
+          (if clicked-id
+            (do
+              (swap! state
+                     (fn [s]
+                       (-> (if (.-shiftKey event)
+                             (model/toggle-selection s clicked-id)
+                             (if (contains? (:selected s) clicked-id)
+                               s
+                               (model/select-item s clicked-id)))
+                           model/close-context-menu)))
+              (when-not (.-shiftKey event)
+                (reset! drag {:mode :move
+                              :origins (into {}
+                                             (comp (filter #(contains? (:selected @state)
+                                                                       (:id %)))
+                                                   (map (juxt :id (juxt :x :y))))
+                                             (:items @state))
+                              :start [(.-clientX event) (.-clientY event)]})))
+            (when-let [p (world-point state root event)]
+              (swap! state #(-> %
+                                model/clear-selection
+                                model/close-context-menu
+                                (model/begin-marquee p))))))
+        (if (and (zero? button)
+                 clicked-id
+                 (not (model/wire-tool? @state))
+                 (not had-context-menu?))
+          (sync-selection! root @state)
+          (render! root @state))))))
 
 (defn- handle-mousemove! [state root drag event]
   (when-not (:dialog @state)
@@ -215,6 +261,13 @@
                       (model/open-context-menu id (.-clientX event) (.-clientY event))))
     (render! root @state)))
 
+(defn- handle-dblclick! [state root event]
+  (when (and (nil? (:dialog @state))
+             (not (model/wire-tool? @state)))
+    (when-let [id (item-id event)]
+      (swap! state model/open-gate-target-dialog id)
+      (render! root @state))))
+
 (defn- shortcut-targets [state]
   (if-let [item-id (get-in state [:context-menu :item-id])]
     #{item-id}
@@ -238,7 +291,7 @@
       (and (= key "Escape") (:dialog current))
       (do
         (.preventDefault event)
-        (swap! state model/cancel-register)
+        (swap! state model/cancel-dialog)
         (render! root @state))
 
       (and (= key "Escape") (model/wire-tool? current))
@@ -306,9 +359,10 @@
       (swap! state model/toggle-snap)
       (render! root @state))
 
-    (closest event "#register-cancel")
+    (or (closest event "#register-cancel")
+        (closest event "#gate-target-cancel"))
     (do
-      (swap! state model/cancel-register)
+      (swap! state model/cancel-dialog)
       (render! root @state))
 
     (closest event "#context-delete")
@@ -320,11 +374,13 @@
 
 (defn- attach-events! [root state]
   (let [drag (atom nil)
+        unsubscribe-menu! (subscribe-menu-save! state)
         root-handlers {:dragstart handle-dragstart!
                        :dragover handle-dragover!
                        :drop #(handle-drop! state root %)
                        :submit #(handle-submit! state root %)
                        :click #(handle-click! state root %)
+                       :dblclick #(handle-dblclick! state root %)
                        :wheel #(handle-wheel! state root %)
                        :mousedown #(handle-mousedown! state root drag %)
                        :contextmenu #(handle-contextmenu! state root drag %)}
@@ -340,7 +396,9 @@
               (doseq [[type handler] root-handlers]
                 (.removeEventListener root (name type) handler false))
               (doseq [[type handler] document-handlers]
-                (.removeEventListener js/document (name type) handler)))}))
+                (.removeEventListener js/document (name type) handler))
+              (when unsubscribe-menu!
+                (unsubscribe-menu!)))}))
 
 (defn init! []
   (when-let [root (.getElementById js/document "app")]

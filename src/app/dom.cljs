@@ -53,6 +53,42 @@
       [(+ x (/ fallback-item-width 2))
        (+ y (/ fallback-item-height 2))])))
 
+(defn- fallback-port-anchor [{:keys [x y width height type] :as item} kind index]
+  (let [[default-width default-height] (if (= :register type)
+                                         [160 fallback-item-height]
+                                         [fallback-item-width fallback-item-height])
+        width (or width default-width)
+        height (or height default-height)
+        count (max 1 (model/port-count item kind))
+        x (if (= :output kind) (+ x width) x)
+        y (+ y (* height (/ (inc index) (inc count))))]
+    [x y]))
+
+(defn- port-anchor [item node kind index]
+  (let [port (when node
+               (.querySelector node
+                               (str ".item-port[data-port-kind=\"" (name kind)
+                                    "\"][data-port-index=\"" index "\"]")))
+        width (when node (.-offsetWidth node))
+        height (when node (.-offsetHeight node))]
+    (if (and port
+             (pos? width)
+             (pos? height)
+             (pos? (.-offsetWidth port))
+             (pos? (.-offsetHeight port)))
+      [(+ (.-offsetLeft node)
+          (.-offsetLeft port)
+          (/ (.-offsetWidth port) 2))
+       (+ (.-offsetTop node)
+          (.-offsetTop port)
+          (/ (.-offsetHeight port) 2))]
+      (fallback-port-anchor item kind index))))
+
+(defn- wire-anchor [item node port]
+  (if port
+    (port-anchor item node (:kind port) (:index port))
+    (item-anchor item node)))
+
 (defn- wire-line [wire from-anchor corners to-anchor draft?]
   (let [points (model/orthogonal-path (into [from-anchor]
                                             (concat corners [to-anchor])))]
@@ -61,6 +97,8 @@
                         :data-wire-id (:id wire)
                         :data-from (:from wire)
                         :data-to (:to wire)
+                        :data-from-port (get-in wire [:from-port :index])
+                        :data-to-port (get-in wire [:to-port :index])
                         :points (str/join " " (map (fn [[x y]] (str x "," y)) points))})))
 
 (defn- marquee-rect [marquee]
@@ -81,21 +119,34 @@
         wires (keep (fn [{:keys [from to points] :as wire}]
                       (when (and (item-at from) (item-at to))
                         (wire-line wire
-                                   (item-anchor (item-at from) (node-at from))
+                                   (wire-anchor (item-at from) (node-at from)
+                                                (:from-port wire))
                                    points
-                                   (item-anchor (item-at to) (node-at to))
+                                   (wire-anchor (item-at to) (node-at to)
+                                                (:to-port wire))
                                    false)))
                     (:wires state))
         draft (:wire-draft state)
         draft-line (when-let [from (:from draft)]
                      (when-let [item (item-at from)]
-                       (wire-line {:from from}
-                                  (item-anchor item (node-at from))
+                       (wire-line {:from from
+                                   :from-port (:from-port draft)}
+                                  (wire-anchor item (node-at from)
+                                               (:from-port draft))
                                   (:points draft)
                                   [(:x draft) (:y draft)]
                                   true)))]
     (append! svg (concat wires [draft-line (marquee-rect (:marquee state))]))
     svg))
+
+(defn- render-ports [kind count]
+  (append! (el "div" {:class (str "item-ports item-ports-" kind)})
+           (map (fn [index]
+                  (el "span" {:class (str "item-port item-port-" kind)
+                              :attrs {:data-port-kind kind
+                                      :data-port-index index
+                                      :title (str (str/capitalize kind) " " index)}}))
+                (range count))))
 
 (defn- render-item [selected {:keys [id type component name qubits] :as item}]
   (let [selected? (contains? selected id)
@@ -104,16 +155,24 @@
                           (when selected? " selected")))]
     (case type
       :gate
-      (el "div" {:class (item-class "gate")
-                 :text (:label (components/by-id component))
-                 :attrs {:data-item-id (str id)}
-                 :style (item-style item)})
+      (let [node (el "div" {:class (item-class "gate")
+                            :attrs {:data-item-id (str id)}
+                            :style (item-style item)})
+            ports (model/gate-port-count item)]
+        (append! node [(render-ports "input" ports)
+                       (el "span" {:class "item-label"
+                                   :text (:label (components/by-id component))})
+                       (render-ports "output" ports)])
+        node)
 
       :register
-      (el "div" {:class (item-class "register")
-                 :text (str name " (" (qubits-label qubits) ")")
-                 :attrs {:data-item-id (str id)}
-                 :style (item-style item)})
+      (let [node (el "div" {:class (item-class "register")
+                            :attrs {:data-item-id (str id)}
+                            :style (item-style item)})]
+        (append! node [(el "span" {:class "item-label"
+                                   :text (str name " (" (qubits-label qubits) ")")})
+                       (render-ports "output" qubits)])
+        node)
 
       nil)))
 
@@ -160,8 +219,8 @@
                                                 " px grid (G)")}})
               (when wire?
                 (el "span" {:class "canvas-hint"
-                            :text (str "Click a component to start; click the canvas "
-                                       "to add a corner; click another component to finish.")}))])))
+                            :text (str "Click an output port to start; click the canvas "
+                                       "to add a corner; click an input port to finish.")}))])))
 
 (defn- node-item-id [node]
   (some-> node
@@ -301,58 +360,104 @@
     (set! (.-value qubits-input) (:qubits dialog))
     (dialog-backdrop "register-dialog-title" form)))
 
-(defn- gate-target-checkbox [dialog register qubit]
-  (let [input (el "input" {:attrs {:type "checkbox"
-                                   :data-register-id (:id register)
-                                   :data-qubit-index qubit}})
-        label (append! (el "label" {:class "gate-target-qubit"})
-                       [input
-                        (.createTextNode js/document
-                                         (str (:name register) "[" qubit "]"))])]
-    (set! (.-checked input)
-          (contains? (:selected dialog) [(:id register) qubit]))
-    label))
-
-(defn- render-gate-target-dialog [state dialog]
+(defn- render-gate-qubits-dialog [state dialog]
   (let [gate (model/item-by-id state (:gate-id dialog))
-        registers (model/connected-registers state (:gate-id dialog))
         gate-label (or (:label (components/by-id (:component gate)))
                        (some-> (:component gate) name)
                        "gate")
-        registers-node (append! (el "div" {:class "gate-target-registers"})
-                                (for [register registers]
-                                  (append! (el "fieldset" {:class "gate-target-register"})
-                                           [(el "legend" {:text (:name register)})
-                                            (map #(gate-target-checkbox dialog register %)
-                                                 (range (:qubits register)))])))
+        qubits-input (el "input" {:attrs {:id "gate-qubits"
+                                          :name "qubits"
+                                          :type "number"
+                                          :min "1"
+                                          :step "1"}})
         actions (append! (el "div" {:class "dialog-actions"})
                          [(el "button" {:class "button-primary"
                                         :text "Apply"
                                         :attrs {:type "submit"
-                                                :id "gate-target-confirm"}})
+                                                :id "gate-qubits-confirm"}})
                           (el "button" {:text "Cancel"
                                         :attrs {:type "button"
-                                                :id "gate-target-cancel"}})])
-        form (append! (el "form" {:attrs {:id "gate-target-form"
+                                                :id "gate-qubits-cancel"}})])
+        form (append! (el "form" {:attrs {:id "gate-qubits-form"
                                           :novalidate "novalidate"}})
                       [(el "h2" {:class "dialog-title"
-                                 :text (str "Select " gate-label " gate targets")
-                                 :attrs {:id "gate-target-dialog-title"}})
+                                 :text (str "Configure " gate-label " gate")
+                                 :attrs {:id "gate-qubits-dialog-title"}})
                        (el "p" {:class "dialog-help"
-                                :text "Choose the qubits this gate acts on."})
-                       registers-node
+                                :text (str "Set the number of qubit ports. Wire each "
+                                           "input port to the qubit it should act on.")})
+                       (el "label" {:text "Number of qubits"
+                                    :attrs {:for "gate-qubits"}})
+                       qubits-input
                        (when-let [error (:error dialog)]
                          (el "p" {:class "dialog-error"
                                   :text error
                                   :attrs {:role "alert"}}))
                        actions])]
-    (dialog-backdrop "gate-target-dialog-title" form)))
+    (set! (.-value qubits-input) (:qubits dialog))
+    (dialog-backdrop "gate-qubits-dialog-title" form)))
+
+(defn- render-custom-dialog [dialog]
+  (let [editing? (some? (:item-id dialog))
+        qubits-input (el "input" {:attrs {:id "custom-qubits"
+                                          :name "qubits"
+                                          :type "number"
+                                          :min "1"
+                                          :step "1"}})
+        qasm-input (el "textarea" {:attrs {:id "custom-qasm"
+                                           :name "qasm"
+                                           :rows "7"
+                                           :spellcheck "false"
+                                           :placeholder "gate pair a, b {\n  h a;\n  cx a, b;\n}"}})
+        actions (append! (el "div" {:class "dialog-actions"})
+                         [(el "button" {:class "button-primary"
+                                        :text (if editing? "Save gate" "Add gate")
+                                        :attrs {:type "submit"
+                                                :id "custom-confirm"}})
+                          (el "button" {:text "Cancel"
+                                        :attrs {:type "button"
+                                                :id "custom-cancel"}})])
+        form (append! (el "form" {:attrs {:id "custom-form"
+                                          :novalidate "novalidate"}})
+                      [(el "h2" {:class "dialog-title"
+                                 :text (if editing? "Edit custom gate"
+                                         "Define custom gate")
+                                 :attrs {:id "custom-dialog-title"}})
+                       (el "p" {:class "dialog-help"
+                                :text (str "Enter an OpenQASM gate declaration. The gate "
+                                           "is called with the qubits wired to its input ports.")})
+                       (el "label" {:text "Number of qubits"
+                                    :attrs {:for "custom-qubits"}})
+                       qubits-input
+                       (el "label" {:text "Gate definition (OpenQASM)"
+                                    :attrs {:for "custom-qasm"}})
+                       qasm-input
+                       (when-let [error (:error dialog)]
+                         (render-error error))
+                       actions])]
+    (set! (.-value qubits-input) (:qubits dialog))
+    (set! (.-value qasm-input) (:qasm dialog))
+    (dialog-backdrop "custom-dialog-title" form)))
 
 (defn render-dialog [state]
   (when-let [dialog (:dialog state)]
-    (if (= :gate-targets (:type dialog))
-      (render-gate-target-dialog state dialog)
+    (case (:type dialog)
+      :gate-qubits (render-gate-qubits-dialog state dialog)
+      :custom-gate (render-custom-dialog dialog)
       (render-register-dialog dialog))))
+
+(defn refresh-wires! [root state]
+  (when-let [stage (.querySelector root "#canvas-stage")]
+    (when-let [old-wires (.querySelector stage ".canvas-wires")]
+      (let [item-nodes (vec (array-seq (.querySelectorAll stage ".canvas-item")))
+            nodes-by-id (into {} (keep (fn [node]
+                                         (when-let [id (node-item-id node)]
+                                           [id node])))
+                               item-nodes)
+            items-by-id (into {} (map (juxt :id identity)) (:items state))]
+        (.replaceChild stage
+                       (render-wires state items-by-id nodes-by-id)
+                       old-wires)))))
 
 (defn render-app [state]
   (append! (el "div" {:class "app"

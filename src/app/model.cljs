@@ -124,6 +124,12 @@
     (nil? (parse-qubits qubits)) {:qubits "Number of qubits must be a positive whole number."}
     :else nil))
 
+(defn validate-custom-gate [qubits qasm]
+  (cond
+    (nil? (parse-qubits qubits)) {:qubits "Number of qubits must be a positive whole number."}
+    (str/blank? (str qasm)) {:qasm "Gate definition is required."}
+    :else nil))
+
 (defn next-register-name [state]
   (let [names (into #{} (keep #(when (= :register (:type %)) (:name %)) (:items state)))]
     (first (remove names (map #(str "register-" %) (iterate inc 1))))))
@@ -195,6 +201,85 @@
          (sort-by (juxt #(or (:y %) 0) #(or (:x %) 0) #(or (:id %) 0)))
          vec)))
 
+(defn gate-port-count [gate]
+  (let [qubits (:qubits gate)]
+    (if (and (integer? qubits) (pos? qubits))
+      qubits
+      1)))
+
+(defn port-count [item kind]
+  (case (:type item)
+    :register (if (= :output kind) (or (:qubits item) 0) 0)
+    :gate (if (contains? #{:input :output} kind) (gate-port-count item) 0)
+    0))
+
+(defn port-used? [state item-id kind index]
+  (boolean
+   (some (fn [wire]
+           (or (and (= item-id (:from wire))
+                    (= kind (get-in wire [:from-port :kind]))
+                    (= index (get-in wire [:from-port :index])))
+               (and (= item-id (:to wire))
+                    (= kind (get-in wire [:to-port :kind]))
+                    (= index (get-in wire [:to-port :index])))))
+         (:wires state))))
+
+(defn free-port-index [state item-id kind]
+  (let [item (item-by-id state item-id)]
+    (first (remove #(port-used? state item-id kind %)
+                   (range (port-count item kind))))))
+
+(defn- incoming-port-wire [state item-id index]
+  (first (filter (fn [wire]
+                   (and (= item-id (:to wire))
+                        (= :input (get-in wire [:to-port :kind]))
+                        (= index (get-in wire [:to-port :index]))))
+                 (:wires state))))
+
+(declare trace-input-target)
+
+(defn- trace-output-target [state item-id index visited]
+  (let [endpoint [item-id :output index]]
+    (when-not (contains? visited endpoint)
+      (trace-input-target state item-id index (conj visited endpoint)))))
+
+(defn- trace-input-target [state item-id index visited]
+  (let [endpoint [item-id :input index]]
+    (when-not (contains? visited endpoint)
+      (when-let [wire (incoming-port-wire state item-id index)]
+        (let [from-id (:from wire)
+              from-item (item-by-id state from-id)
+              from-port (:from-port wire)
+              source-index (:index from-port)]
+          (when (and from-item
+                     (= :output (:kind from-port))
+                     (integer? source-index))
+            (cond
+              (= :register (:type from-item))
+              (when (and (<= 0 source-index)
+                         (< source-index (or (:qubits from-item) 0)))
+                [from-id source-index])
+
+              (= :gate (:type from-item))
+              (trace-output-target state from-id source-index (conj visited endpoint)))))))))
+
+(defn gate-targets [state gate-id]
+  (if-let [gate (item-by-id state gate-id)]
+    (if (= :gate (:type gate))
+      (->> (range (gate-port-count gate))
+           (keep #(trace-input-target state gate-id % #{}))
+           distinct
+           vec)
+      [])
+    []))
+
+(defn gate-port-wired? [state gate-id]
+  (boolean
+   (some (fn [wire]
+           (and (= gate-id (:to wire))
+                (= :input (get-in wire [:to-port :kind]))))
+         (:wires state))))
+
 (defn delete-items [state item-ids]
   (let [item-ids (set item-ids)
         draft (:wire-draft state)]
@@ -222,8 +307,12 @@
 (defn toggle-wire-tool [state]
   (set-tool state (if (wire-tool? state) :select :wire)))
 
-(defn start-wire-draft [state item-id x y]
-  (assoc state :wire-draft {:from item-id :x x :y y :points []}))
+(defn start-wire-draft
+  ([state item-id x y] (start-wire-draft state item-id x y nil))
+  ([state item-id x y from-port]
+   (assoc state :wire-draft
+          (cond-> {:from item-id :x x :y y :points []}
+            from-port (assoc :from-port from-port)))))
 
 (defn update-wire-draft [state x y]
   (if-let [draft (:wire-draft state)]
@@ -269,39 +358,77 @@
                 (partition 2 1 points))
         without-duplicate-points)))
 
-(defn- wire-between? [state from-id to-id]
-  (boolean (some (fn [wire]
-                   (= #{from-id to-id} #{(:from wire) (:to wire)}))
-                 (:wires state))))
+(defn- endpoint-match? [wire side item-id port]
+  (let [wire-item ((if (= side :from) :from :to) wire)
+        wire-port ((if (= side :from) :from-port :to-port) wire)]
+    (and (= item-id wire-item)
+         (if (some? port)
+           (= port wire-port)
+           (nil? wire-port)))))
+
+(defn- wire-between? [state from-id to-id from-port to-port]
+  (boolean
+   (some (fn [wire]
+           (or (and (endpoint-match? wire :from from-id from-port)
+                    (endpoint-match? wire :to to-id to-port))
+               (and (endpoint-match? wire :from to-id to-port)
+                    (endpoint-match? wire :to from-id from-port))))
+         (:wires state))))
 
 (defn- register-item? [item]
   (= :register (:type item)))
 
+(defn- valid-port? [item kind index]
+  (and (integer? index)
+       (<= 0 index)
+       (< index (port-count item kind))))
+
+(defn- valid-wire-ports? [state from-item to-item from-port to-port]
+  (and from-port
+       to-port
+       (= :output (:kind from-port))
+       (= :input (:kind to-port))
+       (valid-port? from-item :output (:index from-port))
+       (valid-port? to-item :input (:index to-port))
+       (not (port-used? state (:id from-item) :output (:index from-port)))
+       (not (port-used? state (:id to-item) :input (:index to-port)))))
+
 (defn add-wire
   ([state from-id to-id] (add-wire state from-id to-id nil))
   ([state from-id to-id points]
+   (add-wire state from-id to-id points nil nil))
+  ([state from-id to-id points from-port to-port]
    (let [from-item (item-by-id state from-id)
-         to-item (item-by-id state to-id)]
+         to-item (item-by-id state to-id)
+         port-wire? (or (some? from-port) (some? to-port))
+         ports-valid? (if port-wire?
+                        (valid-wire-ports? state from-item to-item from-port to-port)
+                        true)]
      (if (and (not= from-id to-id)
               from-item
               to-item
               (not (and (register-item? from-item)
                         (register-item? to-item)))
-              (not (wire-between? state from-id to-id)))
+              ports-valid?
+              (not (wire-between? state from-id to-id from-port to-port)))
        (-> state
            (update :wires conj (cond-> {:id (:next-wire-id state)
                                         :from from-id
                                         :to to-id}
-                                 (seq points) (assoc :points (vec points))))
+                                 (seq points) (assoc :points (vec points))
+                                 from-port (assoc :from-port from-port)
+                                 to-port (assoc :to-port to-port)))
            (update :next-wire-id inc))
        state))))
 
-(defn finish-wire [state to-id]
-  (if-let [draft (:wire-draft state)]
-    (-> state
-        (add-wire (:from draft) to-id (:points draft))
-        (assoc :wire-draft nil))
-    state))
+(defn finish-wire
+  ([state to-id] (finish-wire state to-id nil))
+  ([state to-id to-port]
+   (if-let [draft (:wire-draft state)]
+     (-> state
+         (add-wire (:from draft) to-id (:points draft) (:from-port draft) to-port)
+         (assoc :wire-draft nil))
+     state)))
 
 (defn rotate-items [state item-ids degrees]
   (let [item-ids (set item-ids)]
@@ -338,60 +465,113 @@
                   :error nil}
          :context-menu nil))
 
-(defn- target-pairs [targets]
-  (set (for [[register-id qubits] targets
-             qubit qubits]
-         [register-id qubit])))
+(defn open-custom-dialog [state x y]
+  (assoc state
+         :dialog {:type :custom-gate
+                  :x x
+                  :y y
+                  :qubits "1"
+                  :qasm ""
+                  :error nil}
+         :context-menu nil))
 
-(defn- gate-target-selection [state gate]
-  (if (some? (:targets gate))
-    (target-pairs (:targets gate))
-    (set (for [register (connected-registers state (:id gate))
-               qubit (range (:qubits register))]
-           [(:id register) qubit]))))
-
-(defn open-gate-target-dialog [state gate-id]
-  (if-let [gate (item-by-id state gate-id)]
-    (if (and (= :gate (:type gate))
-             (seq (connected-registers state gate-id)))
+(defn open-custom-editor [state item-id]
+  (if-let [item (item-by-id state item-id)]
+    (if (= :custom (:component item))
       (assoc state
-             :dialog {:type :gate-targets
-                      :gate-id gate-id
-                      :selected (gate-target-selection state gate)
+             :dialog {:type :custom-gate
+                      :item-id item-id
+                      :x (:x item)
+                      :y (:y item)
+                      :qubits (str (gate-port-count item))
+                      :qasm (or (:qasm item) "")
                       :error nil}
              :context-menu nil)
       state)
     state))
 
-(defn- valid-target? [state connected-ids [register-id qubit]]
-  (and (contains? connected-ids register-id)
-       (when-let [register (item-by-id state register-id)]
-         (and (= :register (:type register))
-              (integer? qubit)
-              (<= 0 qubit)
-              (< qubit (:qubits register))))))
+(defn open-gate-qubits-dialog [state gate-id]
+  (if-let [gate (item-by-id state gate-id)]
+    (if (= :gate (:type gate))
+      (assoc state
+             :dialog {:type :gate-qubits
+                      :gate-id gate-id
+                      :qubits (str (gate-port-count gate))
+                      :error nil}
+             :context-menu nil)
+      state)
+    state))
 
-(defn confirm-gate-targets [state selected]
+(defn- overflow-index? [index qubits]
+  (and (integer? index) (>= index qubits)))
+
+(defn- wire-overflows? [gate-id qubits wire]
+  (or (and (= gate-id (:from wire))
+           (overflow-index? (get-in wire [:from-port :index]) qubits))
+      (and (= gate-id (:to wire))
+           (overflow-index? (get-in wire [:to-port :index]) qubits))))
+
+(defn- draft-overflows? [draft gate-id qubits]
+  (and (= gate-id (:from draft))
+       (overflow-index? (get-in draft [:from-port :index]) qubits)))
+
+(defn- update-gate-qubits [state gate-id qubits]
+  (-> state
+      (update :items
+              (fn [items]
+                (mapv (fn [item]
+                        (if (= (:id item) gate-id)
+                          (-> item
+                              (assoc :qubits qubits)
+                              (dissoc :targets))
+                          item))
+                      items)))
+      (update :wires
+              (fn [wires]
+                (filterv #(not (wire-overflows? gate-id qubits %)) wires)))
+      (cond-> (and (:wire-draft state)
+                   (draft-overflows? (:wire-draft state) gate-id qubits))
+        (assoc :wire-draft nil))))
+
+(defn confirm-gate-qubits [state qubits]
   (if-let [dialog (:dialog state)]
-    (if (= :gate-targets (:type dialog))
-      (let [connected-ids (into #{} (map :id) (connected-registers state (:gate-id dialog)))
-            targets (->> selected
-                         (filter #(valid-target? state connected-ids %))
-                         (group-by first)
-                         (map (fn [[register-id pairs]]
-                                [register-id (set (map second pairs))]))
-                         (into {}))]
-        (if (empty? targets)
-          (assoc-in state [:dialog :error] "Select at least one qubit.")
-          (-> state
-              (update :items
-                      (fn [items]
-                        (mapv (fn [item]
-                                (if (= (:id item) (:gate-id dialog))
-                                  (assoc item :targets targets)
-                                  item))
-                              items)))
-              (assoc :dialog nil))))
+    (if (= :gate-qubits (:type dialog))
+      (if-let [n (parse-qubits qubits)]
+        (-> (update-gate-qubits state (:gate-id dialog) n)
+            (assoc :dialog nil))
+        (assoc-in state [:dialog :error]
+                  "Number of qubits must be a positive whole number."))
+      state)
+    state))
+
+(defn confirm-custom-gate [state qubits qasm]
+  (if-let [dialog (:dialog state)]
+    (if (= :custom-gate (:type dialog))
+      (if-let [errors (validate-custom-gate qubits qasm)]
+        (assoc state :dialog (assoc dialog
+                                    :qubits (str qubits)
+                                    :qasm (str qasm)
+                                    :error errors))
+        (let [n (parse-qubits qubits)
+              text (str/trim (str qasm))]
+          (if-let [item-id (:item-id dialog)]
+            (-> (update-gate-qubits state item-id n)
+                (update :items
+                        (fn [items]
+                          (mapv #(if (= item-id (:id %))
+                                   (assoc % :qasm text)
+                                   %)
+                                items)))
+                (assoc :dialog nil))
+            (-> state
+                (add-item {:id (:next-id state)
+                           :type :gate
+                           :component :custom
+                           :qubits n
+                           :qasm text
+                           :x (:x dialog)
+                           :y (:y dialog)})
+                (assoc :dialog nil)))))
       state)
     state))
 
@@ -400,6 +580,7 @@
     (let [[x y] (snap-point state [x y])]
       (case (:kind component)
         :register (open-register-dialog state x y)
+        :custom (open-custom-dialog state x y)
         :gate (add-gate state component x y)
         state))
     state))

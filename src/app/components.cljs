@@ -14,7 +14,8 @@
    {:id :ry :label "Ry" :kind :gate}
    {:id :rz :label "Rz" :kind :gate}
    {:id :p :label "P" :kind :gate}
-   {:id :i :label "I" :kind :gate}])
+   {:id :i :label "I" :kind :gate}
+   {:id :custom :label "Custom" :kind :custom}])
 
 (defn by-id [id]
   (first (filter #(= id (:id %)) components)))

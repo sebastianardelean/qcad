@@ -14,6 +14,14 @@
 (defn- wire [id from to]
   {:id id :from from :to to})
 
+(defn- port-wire [id from to from-index to-index]
+  (assoc (wire id from to)
+         :from-port {:kind :output :index from-index}
+         :to-port {:kind :input :index to-index}))
+
+(defn- custom-gate [id qubits qasm x y]
+  {:id id :type :gate :component :custom :qubits qubits :qasm qasm :x x :y y})
+
 (defn- circuit [items wires]
   {:items items :wires wires})
 
@@ -157,6 +165,59 @@
               "// Unconnected other gate omitted."]
              (body-lines state))))))
 
+(deftest custom-gate-test
+  (testing "a custom gate definition is emitted and called with its wired operands"
+    (let [state (circuit [(register 1 "data" 2 0 0)
+                          (custom-gate 2 2 "gate pair a, b {\n  h a;\n  cx a, b;\n}"
+                                       100 0)]
+                         [(port-wire 1 1 2 0 0)
+                          (port-wire 2 1 2 1 1)])]
+      (is (= ["OPENQASM 3.0;"
+              "include \"stdgates.inc\";"
+              ""
+              "gate pair a, b {"
+              "  h a;"
+              "  cx a, b;"
+              "}"
+              ""
+              "qubit[2] data;"
+              ""
+              "pair data[0], data[1];"]
+             (lines state)))))
+
+  (testing "identical custom gate definitions are emitted once"
+    (let [state (circuit [(register 1 "a" 1 0 0)
+                          (custom-gate 2 1 "gate flip q { x q; }" 100 0)
+                          (custom-gate 3 1 "gate flip q { x q; }" 200 0)]
+                         [(port-wire 1 1 2 0 0)
+                          (port-wire 2 1 3 0 0)])]
+      (is (= 1 (count (filter #(= "gate flip q { x q; }" %) (lines state)))))
+      (is (= ["gate flip q { x q; }" "flip a[0];" "flip a[0];"]
+             (body-lines state)))))
+
+  (testing "a QASM statement without a gate declaration is emitted verbatim"
+    (let [state (circuit [(register 1 "data" 1 0 0)
+                          (custom-gate 2 1 "h data[0];" 100 0)]
+                         [(port-wire 1 1 2 0 0)])]
+      (is (= ["h data[0];"] (body-lines state)))))
+
+  (testing "an incompletely wired custom gate is not emitted as an invalid call"
+    (let [state (circuit [(register 1 "register_1" 2 0 0)
+                          (custom-gate 2 2 "gate pair a, b {\n  h a;\n  cx a, b;\n}"
+                                       100 0)]
+                         [(port-wire 1 1 2 0 0)])
+          body (body-lines state)]
+      (is (not-any? #(str/starts-with? % "pair ") body))
+      (is (some #(str/includes? % "1 of 2 qubits connected") body))))
+
+  (testing "a custom gate whose declaration arity differs from its item is not called"
+    (let [state (circuit [(register 1 "data" 2 0 0)
+                          (custom-gate 2 1 "gate pair a, b { h a; }" 100 0)]
+                         [(port-wire 1 1 2 0 0)])
+          body (body-lines state)]
+      (is (not-any? #(str/starts-with? % "pair ") body))
+      (is (some #(str/includes? % "1 of 2 qubits connected") body)))))
+
 (deftest targeted-gate-test
   (testing "selected qubits are emitted as indexed operands"
     (let [state (-> (circuit [(register 1 "a" 2 0 0)
@@ -190,3 +251,148 @@
                     (assoc-in [:items 1 :targets] {}))]
       (is (= ["// H gate has no selected qubits."]
              (body-lines state))))))
+
+(deftest port-wire-target-test
+  (testing "gate targets come from wired input ports in port order"
+    (let [state (circuit [(register 1 "a" 3 0 0)
+                          (assoc (gate 2 :h 100 0) :qubits 2)]
+                         [(port-wire 1 1 2 2 1)
+                          (port-wire 2 1 2 0 0)])]
+      (is (= ["h a[0];"
+              "h a[2];"]
+             (body-lines state)))))
+
+  (testing "wire targets take precedence over legacy targets"
+    (let [state (-> (circuit [(register 1 "a" 2 0 0)
+                              (gate 2 :h 100 0)]
+                             [(port-wire 1 1 2 1 0)])
+                    (assoc-in [:items 1 :targets] {1 #{0}}))]
+      (is (= ["h a[1];"]
+             (body-lines state)))))
+
+  (testing "gate chains propagate the wired qubit through output ports"
+    (let [state (circuit [(register 1 "a" 2 0 0)
+                          (assoc (gate 2 :h 100 0) :qubits 2)
+                          (assoc (gate 3 :x 200 0) :qubits 2)]
+                         [(port-wire 1 1 2 1 0)
+                          (port-wire 2 2 3 0 1)])]
+      (is (= ["h a[1];"
+              "x a[1];"]
+             (body-lines state)))))
+
+  (testing "a port-wired gate only emits its connected input ports"
+    (let [state (circuit [(register 1 "a" 2 0 0)
+                          (assoc (gate 2 :h 100 0) :qubits 2)]
+                         [(port-wire 1 1 2 1 0)])]
+      (is (= ["h a[1];"]
+             (body-lines state)))))
+
+  (testing "a port-wired gate with no traceable register is reported"
+    (let [state (circuit [(gate 1 :h 100 0)
+                          (gate 2 :x 200 0)]
+                         [(port-wire 1 1 2 0 0)])]
+      (is (= ["// X gate has no connected qubits."
+              "// Unconnected H gate omitted."]
+             (body-lines state))))))
+
+(deftest from-qasm-empty-test
+  (testing "an empty program produces an empty circuit"
+    (let [state (qasm/from-qasm "OPENQASM 3.0;\ninclude \"stdgates.inc\";\n")]
+      (is (= [] (:items state)))
+      (is (= [] (:wires state)))
+      (is (= 1 (:next-id state)))
+      (is (= 1 (:next-wire-id state))))))
+
+(deftest from-qasm-builtins-test
+  (testing "registers, built-in gates, chains, and bare registers are imported"
+    (let [state (qasm/from-qasm
+                 (str "OPENQASM 3.0;\n"
+                      "include \"stdgates.inc\";\n"
+                      "qubit[2] data;\n"
+                      "h data[0];\n"
+                      "rx(pi/2) data[1];\n"
+                      "h data;\n"))
+          gates (filter #(= :gate (:type %)) (:items state))]
+      (is (= [{:id 1 :type :register :component :quantum-register
+               :name "data" :qubits 2 :x 40 :y 40}]
+             (filter #(= :register (:type %)) (:items state))))
+      (is (= [:h :rx :h] (mapv :component gates)))
+      (is (= [1 1 2] (mapv :qubits gates)))
+      (is (= 4 (count (:wires state))))
+      (is (= [{:id 3 :from 2 :to 4
+               :from-port {:kind :output :index 0}
+               :to-port {:kind :input :index 0}}
+              {:id 4 :from 3 :to 4
+               :from-port {:kind :output :index 0}
+               :to-port {:kind :input :index 1}}]
+             (take-last 2 (:wires state))))
+      (is (= ["h data[0];"
+              "rx(pi/2) data[1];"
+              "h data[0];"
+              "h data[1];"]
+             (body-lines state))))))
+
+(deftest from-qasm-registers-test
+  (testing "bare operands expand to all qubits in each register"
+    (let [state (qasm/from-qasm
+                 (str "OPENQASM 3.0;\n"
+                      "qubit[2] a;\n"
+                      "qubit[1] b;\n"
+                      "h a;\n"
+                      "h b;\n"))]
+      (is (= ["a" "b"] (mapv :name (filter #(= :register (:type %))
+                                           (:items state)))))
+      (is (= [2 1] (mapv :qubits (filter #(= :gate (:type %))
+                                         (:items state)))))
+      (is (= ["h a[0];" "h a[1];" "h b[0];"] (body-lines state)))
+      (is (= 3 (count (:wires state)))))))
+
+(deftest from-qasm-custom-test
+  (testing "custom gate declarations are stored and calls are wired"
+    (let [definition "gate pair a, b {\n  h a;\n  cx a, b;\n}"
+          state (qasm/from-qasm
+                 (str "OPENQASM 3.0;\n"
+                      "include \"stdgates.inc\";\n\n"
+                      definition "\n\n"
+                      "qubit[2] data;\n\n"
+                      "pair data[0], data[1];\n"))
+          custom (second (:items state))]
+      (is (= :custom (:component custom)))
+      (is (= 2 (:qubits custom)))
+      (is (= definition (:qasm custom)))
+      (is (= ["OPENQASM 3.0;"
+              "include \"stdgates.inc\";"
+              ""
+              "gate pair a, b {"
+              "  h a;"
+              "  cx a, b;"
+              "}"
+              ""
+              "qubit[2] data;"
+              ""
+              "pair data[0], data[1];"]
+             (lines state))))))
+
+(deftest from-qasm-unknown-gate-test
+  (testing "an undeclared gate call is preserved as a custom gate"
+    (let [state (qasm/from-qasm
+                 (str "OPENQASM 3.0;\n"
+                      "qubit[2] data;\n"
+                      "cx data[0], data[1];\n"))
+          custom (second (:items state))]
+      (is (= :custom (:component custom)))
+      (is (= 2 (:qubits custom)))
+      (is (= "cx data[0], data[1];" (:qasm custom)))
+      (is (= ["cx data[0], data[1];"] (body-lines state))))))
+
+(deftest from-qasm-comments-test
+  (testing "line and block comments are ignored"
+    (let [state (qasm/from-qasm
+                 (str "/* generated by QCAD */\n"
+                      "OPENQASM 3.0;\n"
+                      "qubit[1] data;\n"
+                      "// apply a gate\n"
+                      "h data[0];\n"))]
+      (is (= [:h] (mapv :component (filter #(= :gate (:type %))
+                                           (:items state)))))
+      (is (= 1 (count (:wires state)))))))

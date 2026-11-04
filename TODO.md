@@ -39,6 +39,25 @@
 23. ~~In project root resources/ there are the lexer and parser grammars for openqasm3.0. Save the drawn circuit as openqasm code.~~
 24. ~~Remove Save QASM button~~
 25. ~~add option to double click on each component (gate) connected to a register to specify on which qubits the gate is applied. It can be applied on multiple qubits in same register on multiple qubits in 1 or more registers.~~
-25. For each single qubit gate, add in symbol a input and output port. 
-26. If the gate will be applied on multiple qubits, when double clicking the gate, input the number of qubits. The change shall be reflected on the gate symbol, having multiple inputs and outputs.
-27. For registers, add on the symbol on canvas, an output port for each qubit. If there are multiple qubits, then multiple ports.
+25. ~~For each single qubit gate, add in symbol a input and output port.~~
+26. ~~If the gate will be applied on multiple qubits, when double clicking the gate, input the number of qubits. The change shall be reflected on the gate symbol, having multiple inputs and outputs.~~
+27. ~~For registers, add on the symbol on canvas, an output port for each qubit. If there are multiple qubits, then multiple ports.~~
+28. ~~The wire shall snap only on ports.~~
+29. ~~If a n-qubit is connected to a single qubit gate, that means that the gate is applied on 1 qubit. If I want to be applied on more qubits, I increase the number of qubits on gate, and add another wire from register to gate. Remove the select boxes that are on each gate when double clicking it.~~
+30. ~~In the components list add a rectangle with name Custom which when placed on the canvas opens automatically a popup. This popup shall contain the number of qubits and a field to define in QASM the gate.~~
+31. ~~Example of generated invalid qasm:~~
+```
+OPENQASM 3.0;
+include "stdgates.inc";
+
+gate pair a,b{
+   h a;
+   cx a,b;
+}
+
+qubit[2] register_1;
+
+pair register_1[0]; 
+``
+~~the call to the gate must have 2 parameters but only one is passed. In the circuit the register was configured with 2 qubits and the custom gate is defined to work on 2 qubits. But qasm is invalid.~~
+32. ~~Add the option in toolbar File->Open, to open qasm file. When opened a qasm file, it shall draw the circuit automatically on the circuit.~~

@@ -10,7 +10,11 @@
   (testing "all required gates are present in the specified order"
     (is (= [:h :x :y :z :s :t :sdag :tdag :rx :ry :rz :p :i]
            (mapv :id (filter #(= :gate (:kind %)) components/components))))
-    (is (= 14 (count components/components))))
+    (is (= 15 (count components/components))))
+
+  (testing "a custom gate component is available"
+    (is (= {:id :custom :label "Custom" :kind :custom}
+           (components/by-id :custom))))
 
   (testing "component labels"
     (is (= "Quantum register" (:label (components/by-id :quantum-register))))

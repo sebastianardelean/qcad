@@ -5,7 +5,8 @@
 
 (defn- render! [root state]
   (set! (.-innerHTML root) "")
-  (.appendChild root (dom/render-app state)))
+  (.appendChild root (dom/render-app state))
+  (dom/refresh-wires! root state))
 
 (defn- save-qasm! [state]
   (let [api (.-electronAPI js/window)]
@@ -19,6 +20,25 @@
   (when-let [api (.-electronAPI js/window)]
     (when-let [on-menu-save (.-onMenuSave api)]
       (on-menu-save #(save-qasm! state)))))
+
+(defn- open-qasm! [state root]
+  (let [api (.-electronAPI js/window)]
+    (if-let [open (and api (.-openQasm api))]
+      (-> (.openQasm api)
+          (.then (fn [^js result]
+                   (when (and result
+                              (not (.-canceled result))
+                              (string? (.-content result)))
+                     (reset! state (qasm/from-qasm (.-content result)))
+                     (render! root @state))))
+          (.catch (fn [error]
+                    (js/console.error "Could not open OpenQASM." error))))
+      (js/console.warn "Opening requires the Electron application."))))
+
+(defn- subscribe-menu-open! [state root]
+  (when-let [api (.-electronAPI js/window)]
+    (when-let [on-menu-open (.-onMenuOpen api)]
+      (on-menu-open #(open-qasm! state root)))))
 
 (defn- closest [event selector]
   (some-> (.-target event) (.closest selector)))
@@ -64,14 +84,6 @@
         (swap! state model/handle-drop component-id x y)
         (render! root @state)))))
 
-(defn- checked-targets [form]
-  (->> (array-seq (.querySelectorAll form "input[data-qubit-index]"))
-       (filter #(.-checked %))
-       (map (fn [input]
-              [(js/parseInt (.getAttribute input "data-register-id") 10)
-               (js/parseInt (.getAttribute input "data-qubit-index") 10)]))
-       set))
-
 (defn- handle-submit! [state root event]
   (when-let [form (closest event "form")]
     (.preventDefault event)
@@ -82,9 +94,15 @@
         (swap! state model/confirm-register name qubits)
         (render! root @state))
 
-      "gate-target-form"
-      (do
-        (swap! state model/confirm-gate-targets (checked-targets form))
+      "gate-qubits-form"
+      (let [qubits (.-value (.querySelector form "#gate-qubits"))]
+        (swap! state model/confirm-gate-qubits qubits)
+        (render! root @state))
+
+      "custom-form"
+      (let [qubits (.-value (.querySelector form "#custom-qubits"))
+            qasm (.-value (.querySelector form "#custom-qasm"))]
+        (swap! state model/confirm-custom-gate qubits qasm)
         (render! root @state))
 
       nil)))
@@ -93,6 +111,34 @@
   (some-> (closest event "[data-item-id]")
           (.getAttribute "data-item-id")
           (js/parseInt 10)))
+
+(defn- port-info [event]
+  (when-let [node (closest event ".item-port")]
+    (let [kind (some-> node (.getAttribute "data-port-kind") keyword)
+          index (js/parseInt (.getAttribute node "data-port-index") 10)]
+      (when (and (contains? #{:input :output} kind)
+                 (not (js/isNaN index)))
+        {:kind kind :index index}))))
+
+(defn- free-port [state item-id kind]
+  (when-let [index (model/free-port-index @state item-id kind)]
+    {:kind kind :index index}))
+
+(defn- wire-start-port [state event]
+  (when-let [id (item-id event)]
+    (if-let [port (port-info event)]
+      (when (and (= :output (:kind port))
+                 (not (model/port-used? @state id :output (:index port))))
+        port)
+      (free-port state id :output))))
+
+(defn- wire-end-port [state event]
+  (when-let [id (item-id event)]
+    (if-let [port (port-info event)]
+      (when (and (= :input (:kind port))
+                 (not (model/port-used? @state id :input (:index port))))
+        port)
+      (free-port state id :input))))
 
 (defn- measured-items [root state]
   (let [nodes (into {}
@@ -140,7 +186,9 @@
             (when-let [p (world-point state root event)]
               (.preventDefault event)
               (when-not (:wire-draft @state)
-                (swap! state model/start-wire-draft clicked-id (first p) (second p))))
+                (when-let [port (wire-start-port state event)]
+                  (swap! state model/start-wire-draft
+                         clicked-id (first p) (second p) port))))
             (when (:wire-draft @state)
               (.preventDefault event)))
 
@@ -229,7 +277,7 @@
             finishing-wire?
             (if-let [id (item-id event)]
               (when (not= id (:from draft))
-                (swap! state model/finish-wire id)
+                (swap! state model/finish-wire id (wire-end-port state event))
                 true)
               (when-let [p (world-point state root event)]
                 (swap! state model/add-wire-point (first p) (second p))
@@ -265,7 +313,10 @@
   (when (and (nil? (:dialog @state))
              (not (model/wire-tool? @state)))
     (when-let [id (item-id event)]
-      (swap! state model/open-gate-target-dialog id)
+      (swap! state (fn [current]
+                     (if (= :custom (:component (model/item-by-id current id)))
+                       (model/open-custom-editor current id)
+                       (model/open-gate-qubits-dialog current id))))
       (render! root @state))))
 
 (defn- shortcut-targets [state]
@@ -360,7 +411,8 @@
       (render! root @state))
 
     (or (closest event "#register-cancel")
-        (closest event "#gate-target-cancel"))
+        (closest event "#gate-qubits-cancel")
+        (closest event "#custom-cancel"))
     (do
       (swap! state model/cancel-dialog)
       (render! root @state))
@@ -374,7 +426,8 @@
 
 (defn- attach-events! [root state]
   (let [drag (atom nil)
-        unsubscribe-menu! (subscribe-menu-save! state)
+        unsubscribe-menu-save! (subscribe-menu-save! state)
+        unsubscribe-menu-open! (subscribe-menu-open! state root)
         root-handlers {:dragstart handle-dragstart!
                        :dragover handle-dragover!
                        :drop #(handle-drop! state root %)
@@ -397,8 +450,10 @@
                 (.removeEventListener root (name type) handler false))
               (doseq [[type handler] document-handlers]
                 (.removeEventListener js/document (name type) handler))
-              (when unsubscribe-menu!
-                (unsubscribe-menu!)))}))
+              (when unsubscribe-menu-save!
+                (unsubscribe-menu-save!))
+              (when unsubscribe-menu-open!
+                (unsubscribe-menu-open!)))}))
 
 (defn init! []
   (when-let [root (.getElementById js/document "app")]

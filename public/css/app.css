@@ -128,6 +128,15 @@ body {
   cursor: crosshair;
 }
 
+.canvas-wire-mode .item-port {
+  pointer-events: auto;
+  cursor: crosshair;
+}
+
+.canvas-wire-mode .item-port:hover {
+  background: #2680c2;
+}
+
 .canvas-wires {
   position: absolute;
   inset: 0;
@@ -189,6 +198,10 @@ body {
 
 .component-gate {
   border-left: 5px solid #2b6cb0;
+}
+
+.component-custom {
+  border-left: 5px solid #805ad5;
 }
 
 .canvas-item {
@@ -287,14 +300,24 @@ body {
   color: #52606d;
 }
 
-.dialog input {
+.dialog input,
+.dialog textarea {
   padding: 8px 10px;
   border: 1px solid #9aa5b1;
   border-radius: 4px;
   font: inherit;
 }
 
-.dialog input:focus {
+.dialog textarea {
+  resize: vertical;
+  min-height: 120px;
+  font-family: ui-monospace, "Cascadia Code", "Consolas", monospace;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.dialog input:focus,
+.dialog textarea:focus {
   outline: 2px solid #2680c2;
   outline-offset: 1px;
 }
@@ -337,38 +360,33 @@ body {
   font-size: 13px;
 }
 
-.gate-target-registers {
+.canvas-item {
+  gap: 10px;
+}
+
+.item-label {
+  white-space: nowrap;
+}
+
+.item-ports {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  max-height: 40vh;
-  overflow-y: auto;
+  justify-content: space-around;
+  align-self: stretch;
+  gap: 4px;
+  min-height: 18px;
 }
 
-.gate-target-register {
-  margin: 0;
-  padding: 8px 10px 4px;
-  border: 1px solid #d9e2ec;
-  border-radius: 6px;
+.item-port {
+  width: 8px;
+  height: 8px;
+  border: 2px solid #2b6cb0;
+  border-radius: 50%;
+  background: #ffffff;
+  flex: 0 0 auto;
+  pointer-events: none;
 }
 
-.gate-target-register legend {
-  padding: 0 4px;
-  color: #334e68;
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.gate-target-qubit {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 0;
-  font-weight: 400;
-}
-
-.dialog .gate-target-qubit input {
-  width: auto;
-  margin: 0;
-  padding: 0;
+.canvas-register .item-port {
+  border-color: #2f855a;
 }

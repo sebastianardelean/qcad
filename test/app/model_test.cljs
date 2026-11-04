@@ -100,6 +100,81 @@
       (is (= "0" (get-in state [:dialog :qubits])))
       (is (map? (get-in state [:dialog :error]))))))
 
+(deftest validate-custom-gate-test
+  (is (nil? (model/validate-custom-gate "2" "gate pair a, b { h a; }")))
+  (is (contains? (model/validate-custom-gate "0" "gate pair a, b { h a; }")
+                 :qubits))
+  (is (contains? (model/validate-custom-gate "2" "   ") :qasm))
+  (is (contains? (model/validate-custom-gate "2" nil) :qasm)))
+
+(deftest open-custom-dialog-test
+  (testing "dropping the custom component opens its dialog without adding an item"
+    (let [state (model/handle-drop model/initial-state :custom 13 27)]
+      (is (= [] (:items state)))
+      (is (= {:type :custom-gate
+              :x 20
+              :y 20
+              :qubits "1"
+              :qasm ""
+              :error nil}
+             (:dialog state))))))
+
+(deftest confirm-custom-gate-test
+  (testing "a valid definition adds a gate-like item with its QASM"
+    (let [state (-> model/initial-state
+                    (model/handle-drop :custom 30 40)
+                    (model/confirm-custom-gate " 2 " "  gate pair a, b { h a; }  "))]
+      (is (= [{:id 1
+               :type :gate
+               :component :custom
+               :qubits 2
+               :qasm "gate pair a, b { h a; }"
+               :x 40
+               :y 40}]
+             (:items state)))
+      (is (nil? (:dialog state)))
+      (is (= 2 (:next-id state)))))
+
+  (testing "invalid values keep the dialog open with errors"
+    (let [state (-> model/initial-state
+                    (model/handle-drop :custom 0 0)
+                    (model/confirm-custom-gate "0" ""))]
+      (is (= [] (:items state)))
+      (is (= "0" (get-in state [:dialog :qubits])))
+      (is (= "" (get-in state [:dialog :qasm])))
+      (is (map? (get-in state [:dialog :error]))))))
+
+(deftest edit-custom-gate-test
+  (testing "opening the editor seeds it from the custom gate"
+    (let [state (-> model/initial-state
+                    (model/handle-drop :custom 0 0)
+                    (model/confirm-custom-gate "2" "gate pair a, b { h a; }")
+                    (model/open-custom-editor 1))]
+      (is (= {:type :custom-gate
+              :item-id 1
+              :x 0
+              :y 0
+              :qubits "2"
+              :qasm "gate pair a, b { h a; }"
+              :error nil}
+             (:dialog state)))))
+
+  (testing "confirming an edit updates the existing item"
+    (let [state (-> model/initial-state
+                    (model/handle-drop :custom 0 0)
+                    (model/confirm-custom-gate "2" "gate pair a, b { h a; }")
+                    (model/open-custom-editor 1)
+                    (model/confirm-custom-gate "3" "gate triple a, b, c { h a; }"))]
+      (is (= 1 (count (:items state))))
+      (is (= 3 (get-in state [:items 0 :qubits])))
+      (is (= "gate triple a, b, c { h a; }" (get-in state [:items 0 :qasm])))))
+
+  (testing "only custom gates can be edited"
+    (let [state {:items [{:id 1 :type :register :name "a" :qubits 2}]
+                 :wires []}]
+      (is (= state (model/open-custom-editor state 1)))
+      (is (= state (model/open-custom-editor state 99))))))
+
 (deftest cancel-register-test
   (let [state (-> model/initial-state
                   (model/handle-drop :quantum-register 0 0)
@@ -246,6 +321,19 @@
       (model/handle-drop :h 10 20)
       (model/handle-drop :x 100 200)))
 
+(defn- with-register-and-gate []
+  (-> model/initial-state
+      (model/handle-drop :quantum-register 0 0)
+      (model/confirm-register "data" "3")
+      (model/handle-drop :h 100 0)
+      (update :items
+              (fn [items]
+                (mapv #(if (= :gate (:type %))
+                         (assoc % :qubits 2)
+                         %)
+                      items)))))
+
+
 (deftest wire-tool-test
   (testing "the select tool is active by default"
     (is (= :select (:tool model/initial-state)))
@@ -268,6 +356,16 @@
       (is (= {:from 1 :x 30 :y 40 :points []}
              (:wire-draft (model/update-wire-draft state 30 40))))
       (is (nil? (:wire-draft (model/cancel-wire-draft state))))))
+
+  (testing "a draft records the source port when one is supplied"
+    (let [port {:kind :output :index 2}
+          state (model/start-wire-draft model/initial-state 1 10 20 port)]
+      (is (= {:from 1
+              :from-port port
+              :x 10
+              :y 20
+              :points []}
+             (:wire-draft state)))))
 
   (testing "updating or cancelling without a draft is a no-op"
     (is (= model/initial-state (model/update-wire-draft model/initial-state 1 2)))
@@ -334,6 +432,61 @@
       (is (= [{:id 1 :from 1 :to 2 :points [[50 60] [70 80]]}]
              (:wires state))))))
 
+(deftest port-wire-test
+  (testing "a port wire stores both endpoints"
+    (let [from-port {:kind :output :index 1}
+          to-port {:kind :input :index 1}
+          state (-> (with-register-and-gate)
+                    (model/add-wire 1 2 nil from-port to-port))]
+      (is (= [{:id 1
+               :from 1
+               :to 2
+               :from-port from-port
+               :to-port to-port}]
+             (:wires state)))))
+
+  (testing "different ports allow multiple wires between the same items"
+    (let [state (-> (with-register-and-gate)
+                    (model/add-wire 1 2 nil
+                                    {:kind :output :index 0}
+                                    {:kind :input :index 0})
+                    (model/add-wire 1 2 nil
+                                    {:kind :output :index 1}
+                                    {:kind :input :index 1}))]
+      (is (= [[0 0] [1 1]]
+             (mapv (juxt (comp :index :from-port) (comp :index :to-port))
+                   (:wires state))))))
+
+  (testing "a port can only be connected once"
+    (let [state (-> (with-two-gates)
+                    (model/add-wire 1 2 nil
+                                    {:kind :output :index 0}
+                                    {:kind :input :index 0}))]
+      (is (= state (model/add-wire state 1 2 nil
+                                   {:kind :output :index 0}
+                                   {:kind :input :index 0})))))
+
+  (testing "invalid port kinds and indices are rejected"
+    (let [state (with-register-and-gate)]
+      (is (= state (model/add-wire state 1 2 nil
+                                   {:kind :input :index 0}
+                                   {:kind :input :index 0})))
+      (is (= state (model/add-wire state 1 2 nil
+                                   {:kind :output :index 0}
+                                   {:kind :output :index 0})))
+      (is (= state (model/add-wire state 1 2 nil
+                                   {:kind :output :index 9}
+                                   {:kind :input :index 0})))
+      (is (= state (model/add-wire state 1 2 nil
+                                   {:kind :output :index 0}
+                                   {:kind :input :index 9})))))
+
+  (testing "wires cannot mix item-level and port-level endpoints"
+    (let [state (with-two-gates)]
+      (is (= state (model/add-wire state 1 2 nil
+                                   {:kind :output :index 0}
+                                   nil))))))
+
 (deftest finish-wire-test
   (testing "finishing a draft connects to the target and clears the draft"
     (let [state (-> (with-two-gates)
@@ -348,6 +501,20 @@
                     (model/add-wire-point 50 60)
                     (model/finish-wire 2))]
       (is (= [{:id 1 :from 1 :to 2 :points [[50 60]]}] (:wires state)))
+      (is (nil? (:wire-draft state)))))
+
+  (testing "finishing a port draft keeps both endpoints"
+    (let [from-port {:kind :output :index 1}
+          to-port {:kind :input :index 0}
+          state (-> (with-register-and-gate)
+                    (model/start-wire-draft 1 0 0 from-port)
+                    (model/finish-wire 2 to-port))]
+      (is (= [{:id 1
+               :from 1
+               :to 2
+               :from-port from-port
+               :to-port to-port}]
+             (:wires state)))
       (is (nil? (:wire-draft state)))))
 
   (testing "finishing on the source item does not create a wire"
@@ -574,55 +741,182 @@
   (testing "unconnected gates have no registers"
     (is (= [] (model/connected-registers (target-circuit) 99)))))
 
-(deftest open-gate-target-dialog-test
-  (testing "the dialog defaults to every qubit of every connected register"
-    (let [state (model/open-gate-target-dialog (target-circuit) 3)]
-      (is (= {:type :gate-targets
+(defn- port-target-circuit []
+  {:items [{:id 1 :type :register :name "a" :qubits 2 :x 0 :y 0}
+           {:id 2 :type :register :name "b" :qubits 3 :x 0 :y 100}
+           {:id 3 :type :gate :component :h :qubits 2 :x 100 :y 0}
+           {:id 4 :type :gate :component :x :qubits 2 :x 200 :y 0}]
+   :wires [{:id 1
+            :from 1
+            :to 3
+            :from-port {:kind :output :index 1}
+            :to-port {:kind :input :index 0}}
+           {:id 2
+            :from 2
+            :to 3
+            :from-port {:kind :output :index 0}
+            :to-port {:kind :input :index 1}}
+           {:id 3
+            :from 3
+            :to 4
+            :from-port {:kind :output :index 0}
+            :to-port {:kind :input :index 0}}
+           {:id 4
+            :from 3
+            :to 4
+            :from-port {:kind :output :index 1}
+            :to-port {:kind :input :index 1}}]})
+
+(deftest gate-targets-test
+  (testing "targets are traced from register output ports"
+    (is (= [[1 1] [2 0]] (model/gate-targets (port-target-circuit) 3))))
+
+  (testing "targets propagate through gate input and output port indices"
+    (is (= [[1 1] [2 0]] (model/gate-targets (port-target-circuit) 4))))
+
+  (testing "the same qubit is not reported twice"
+    (let [state (-> (port-target-circuit)
+                    (assoc-in [:wires 1 :from] 1)
+                    (assoc-in [:wires 1 :from-port]
+                              {:kind :output :index 1}))]
+      (is (= [[1 1]] (model/gate-targets state 3)))))
+
+  (testing "cycles and unconnected gates produce no targets"
+    (let [cycle {:items [{:id 2 :type :gate :component :h}
+                         {:id 3 :type :gate :component :x}]
+                 :wires [{:id 1
+                          :from 3
+                          :to 2
+                          :from-port {:kind :output :index 0}
+                          :to-port {:kind :input :index 0}}
+                         {:id 2
+                          :from 2
+                          :to 3
+                          :from-port {:kind :output :index 0}
+                          :to-port {:kind :input :index 0}}]}]
+      (is (= [] (model/gate-targets cycle 2)))))
+  (testing "invalid source ports are ignored"
+    (let [base (port-target-circuit)]
+      (is (= [[2 0]] (model/gate-targets (assoc-in base [:wires 0 :from] 99) 3)))
+      (is (= [[2 0]]
+             (model/gate-targets
+              (assoc-in base [:wires 0 :from-port] {:kind :input :index 0})
+              3)))
+      (is (= [[2 0]]
+             (model/gate-targets
+              (assoc-in base [:wires 0 :from-port] {:kind :output :index 9})
+              3)))))
+  (is (= [] (model/gate-targets (port-target-circuit) 1)))
+  (is (= [] (model/gate-targets (port-target-circuit) 99)))
+  (is (true? (model/gate-port-wired? (port-target-circuit) 3)))
+  (is (true? (model/gate-port-wired? (port-target-circuit) 4)))
+  (is (false? (model/gate-port-wired? (port-target-circuit) 99)))
+  (is (false? (model/gate-port-wired?
+               (assoc (port-target-circuit)
+                      :wires [{:id 1 :from 3 :to 4
+                               :from-port {:kind :output :index 0}}])
+               3))))
+
+(deftest open-gate-qubits-dialog-test
+  (testing "the dialog starts from the gate's current port count"
+    (let [state (model/open-gate-qubits-dialog (target-circuit) 3)]
+      (is (= {:type :gate-qubits
               :gate-id 3
-              :selected #{[1 0] [1 1] [2 0] [2 1] [2 2]}
+              :qubits "1"
               :error nil}
              (:dialog state)))
       (is (nil? (:context-menu state)))))
 
-  (testing "existing targets seed the dialog"
+  (testing "an existing qubit count seeds the dialog"
     (let [state (-> (target-circuit)
-                    (assoc-in [:items 2 :targets] {1 #{1} 2 #{0 2}})
-                    (model/open-gate-target-dialog 3))]
-      (is (= #{[1 1] [2 0] [2 2]} (get-in state [:dialog :selected])))))
+                    (assoc-in [:items 2 :qubits] 3)
+                    (model/open-gate-qubits-dialog 3))]
+      (is (= "3" (get-in state [:dialog :qubits])))))
 
-  (testing "only gates with connected registers open the dialog"
-    (is (= (target-circuit) (model/open-gate-target-dialog (target-circuit) 1)))
-    (is (= (target-circuit) (model/open-gate-target-dialog (target-circuit) 99)))))
+  (testing "only gates open the dialog"
+    (is (= (target-circuit) (model/open-gate-qubits-dialog (target-circuit) 1)))
+    (is (= (target-circuit) (model/open-gate-qubits-dialog (target-circuit) 99)))))
 
-(deftest confirm-gate-targets-test
-  (testing "selected qubits are stored on the gate"
+(deftest confirm-gate-qubits-test
+  (testing "the qubit count is stored and old target selections are cleared"
     (let [state (-> (target-circuit)
-                    (model/open-gate-target-dialog 3)
-                    (model/confirm-gate-targets #{[1 1] [2 0] [2 2]}))]
+                    (assoc-in [:items 2 :targets] {1 #{0}})
+                    (model/open-gate-qubits-dialog 3)
+                    (model/confirm-gate-qubits "2"))]
       (is (nil? (:dialog state)))
-      (is (= {1 #{1} 2 #{0 2}} (get-in state [:items 2 :targets])))
-      (is (nil? (get-in state [:items 3 :targets])))))
-
-  (testing "invalid or unconnected selections are ignored"
-    (let [state (-> (target-circuit)
-                    (model/open-gate-target-dialog 3)
-                    (model/confirm-gate-targets #{[1 5] [2 1] [99 0]}))]
-      (is (= {2 #{1}} (get-in state [:items 2 :targets])))))
-
-  (testing "an empty selection keeps the dialog open with an error"
-    (let [state (-> (target-circuit)
-                    (model/open-gate-target-dialog 3)
-                    (model/confirm-gate-targets #{}))]
-      (is (= "Select at least one qubit." (get-in state [:dialog :error])))
+      (is (= 2 (get-in state [:items 2 :qubits])))
       (is (nil? (get-in state [:items 2 :targets])))))
 
-  (testing "confirming without a target dialog is a no-op"
-    (let [state (assoc model/initial-state :dialog {:name "q"})]
-      (is (= state (model/confirm-gate-targets state #{[1 0]}))))))
+  (testing "invalid counts keep the dialog open with an error"
+    (let [state (-> (target-circuit)
+                    (model/open-gate-qubits-dialog 3)
+                    (model/confirm-gate-qubits "0"))]
+      (is (= "Number of qubits must be a positive whole number."
+             (get-in state [:dialog :error])))
+      (is (nil? (get-in state [:items 2 :qubits])))))
+
+  (testing "reducing the count removes wires on removed ports and stale drafts"
+    (let [state (-> (port-target-circuit)
+                    (model/open-gate-qubits-dialog 3)
+                    (model/start-wire-draft 3 0 0 {:kind :output :index 1})
+                    (model/confirm-gate-qubits "1"))]
+      (is (= [1 3] (mapv :id (:wires state))))
+      (is (nil? (:wire-draft state)))
+      (is (= 1 (get-in state [:items 2 :qubits])))))
+
+  (testing "confirming without a gate dialog is a no-op"
+    (is (= model/initial-state
+           (model/confirm-gate-qubits model/initial-state "2")))))
 
 (deftest cancel-dialog-test
-  (testing "cancel clears register and gate target dialogs"
+  (testing "cancel clears register and gate qubit dialogs"
     (let [register-state (assoc model/initial-state :dialog {:name "q"})
-          gate-state (model/open-gate-target-dialog (target-circuit) 3)]
+          gate-state (model/open-gate-qubits-dialog (target-circuit) 3)]
       (is (nil? (:dialog (model/cancel-dialog register-state))))
-      (is (nil? (:dialog (model/cancel-dialog gate-state)))))))
+      (is (nil? (:dialog (model/cancel-dialog gate-state))))))
+  (testing "cancelling without a dialog is a no-op"
+    (is (= model/initial-state (model/cancel-dialog model/initial-state)))))
+
+(deftest gate-port-count-test
+  (testing "gates default to one input and output port"
+    (is (= 1 (model/gate-port-count {:type :gate})))
+    (is (= 1 (model/gate-port-count {:type :gate :qubits 0}))))
+
+  (testing "port count follows the configured qubit count"
+    (is (= 2 (model/gate-port-count {:type :gate :qubits 2})))
+    (is (= 3 (model/gate-port-count {:type :gate :qubits 3}))))
+
+  (testing "legacy target selections no longer control port count"
+    (is (= 1 (model/gate-port-count {:type :gate :targets {1 #{0 2}}}))))
+
+  (testing "only gates expose input and output ports"
+    (is (= 2 (model/port-count {:type :register :qubits 2} :output)))
+    (is (= 0 (model/port-count {:type :register :qubits 2} :input)))
+    (is (= 1 (model/port-count {:type :gate} :input)))
+    (is (= 1 (model/port-count {:type :gate} :output)))
+    (is (= 0 (model/port-count {:type :gate} :other)))
+    (is (= 0 (model/port-count {:type :other} :output)))))
+
+(deftest free-port-index-test
+  (testing "the first unused port is returned"
+    (let [state (-> (with-register-and-gate)
+                    (model/add-wire 1 2 nil
+                                    {:kind :output :index 0}
+                                    {:kind :input :index 0}))]
+      (is (= 1 (model/free-port-index state 1 :output)))
+      (is (= 1 (model/free-port-index state 2 :input)))
+      (is (= 0 (model/free-port-index state 2 :output)))))
+
+  (testing "an item with every port used has no free port"
+    (let [state (-> (with-register-and-gate)
+                    (model/add-wire 1 2 nil
+                                    {:kind :output :index 0}
+                                    {:kind :input :index 0})
+                    (model/add-wire 1 2 nil
+                                    {:kind :output :index 1}
+                                    {:kind :input :index 1}))]
+      (is (nil? (model/free-port-index state 2 :input)))
+      (is (= 2 (model/free-port-index state 1 :output)))))
+
+  (testing "an unknown item has no free ports"
+    (is (nil? (model/free-port-index model/initial-state 99 :output)))))

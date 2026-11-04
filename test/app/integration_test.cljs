@@ -124,8 +124,9 @@
 (deftest components-panel-test
   (testing "all required components are rendered as draggable rectangles"
     (let [tiles (select-all ".component-tile")]
-      (is (= 14 (count tiles)))
-      (is (= ["quantum-register" "h" "x" "y" "z" "s" "t" "sdag" "tdag" "rx" "ry" "rz" "p" "i"]
+      (is (= 15 (count tiles)))
+      (is (= ["quantum-register" "h" "x" "y" "z" "s" "t" "sdag" "tdag" "rx" "ry" "rz" "p" "i"
+              "custom"]
              (mapv #(.getAttribute % "data-component-id") tiles)))
       (is (every? #(= "true" (.getAttribute % "draggable")) tiles))
       (is (= "Quantum register" (.-textContent (first tiles))))
@@ -374,6 +375,10 @@
 (defn- toggle-wire-tool! []
   (.click (select "#wire-tool")))
 
+(defn- ensure-wire-tool! []
+  (when-not (some? (select ".canvas-wire-mode"))
+    (toggle-wire-tool!)))
+
 (defn- mouse-up-on! [target options]
   (.dispatchEvent target (mouse-event "mouseup" options)))
 
@@ -381,7 +386,7 @@
   ([from-id to-id]
    (draw-wire! from-id to-id 100 100 200 200))
   ([from-id to-id from-x from-y to-x to-y]
-   (toggle-wire-tool!)
+   (ensure-wire-tool!)
    (mouse-down! (select (str "[data-item-id=\"" from-id "\"]"))
                 {:clientX from-x :clientY from-y})
    (mouse-move! {:clientX to-x :clientY to-y})
@@ -422,7 +427,7 @@
       (is (= "1" (.getAttribute wire "data-from")))
       (is (= "2" (.getAttribute wire "data-to")))
       (is (nil? (select "#wire-draft")))
-      (is (= [[122 118] [172 118] [172 218] [222 218]] points))
+      (is (= [[144 118] [172 118] [172 218] [200 218]] points))
       (is (axis-aligned? points)))))
 
 (deftest wire-preview-test
@@ -435,11 +440,11 @@
     (let [draft (select "#wire-draft")
           points (polyline-points draft)]
       (is (some? draft))
-      (is (= [[122 118] [136 118] [136 160] [150 160]] points))
+      (is (= [[144 118] [147 118] [147 160] [150 160]] points))
       (is (axis-aligned? points)))
     (mouse-up-on! (select "#canvas-panel") {:clientX 150 :clientY 160})
     (is (some? (select "#wire-draft")))
-    (is (= [[122 118] [136 118] [136 160] [150 160]]
+    (is (= [[144 118] [147 118] [147 160] [150 160]]
            (polyline-points (select "#wire-draft"))))
     (is (nil? (select "[data-wire-id]")))
     (key-down! "Escape")
@@ -456,7 +461,7 @@
     (mouse-down! (select "[data-item-id=\"2\"]") {:clientX 200 :clientY 200})
     (mouse-up-on! (select "[data-item-id=\"2\"]") {:clientX 200 :clientY 200})
     (is (nil? (select "#wire-draft")))
-    (is (= [[122 118] [172 118] [172 218] [222 218]]
+    (is (= [[144 118] [172 118] [172 218] [200 218]]
            (polyline-points (select "[data-wire-id]"))))))
 
 (deftest wire-click-routing-test
@@ -472,19 +477,19 @@
       (mouse-move! {:clientX 150 :clientY 160})
       (mouse-down! (select "#canvas-panel") {:clientX 150 :clientY 160})
       (mouse-up-on! (select "#canvas-panel") {:clientX 150 :clientY 160})
-      (is (= [[122 118] [136 118] [136 160] [150 160]]
+      (is (= [[144 118] [147 118] [147 160] [150 160]]
              (polyline-points (select "#wire-draft"))))
 
       (mouse-move! {:clientX 180 :clientY 190})
-      (is (= [[122 118] [136 118] [136 160] [150 160]
+      (is (= [[144 118] [147 118] [147 160] [150 160]
               [165 160] [165 190] [180 190]]
              (polyline-points (select "#wire-draft"))))
 
       (mouse-down! (select "[data-item-id=\"2\"]") {:clientX 200 :clientY 200})
       (mouse-up-on! (select "[data-item-id=\"2\"]") {:clientX 200 :clientY 200})
       (is (nil? (select "#wire-draft")))
-      (is (= [[122 118] [136 118] [136 160] [150 160]
-              [186 160] [186 218] [222 218]]
+      (is (= [[144 118] [147 118] [147 160] [150 160]
+              [175 160] [175 218] [200 218]]
              (polyline-points (select "[data-wire-id]")))))))
 
 (deftest wire-follows-component-test
@@ -498,7 +503,7 @@
     (mouse-up!)
     (let [wire (select ".canvas-wire")
           points (polyline-points wire)]
-      (is (= [[142 138] [182 138] [182 218] [222 218]] points))
+      (is (= [[164 138] [182 138] [182 218] [200 218]] points))
       (is (axis-aligned? points)))))
 
 (deftest wire-validation-test
@@ -711,52 +716,195 @@
       (let [[content suggested-name] (first @calls)]
         (is (= "circuit.qasm" suggested-name))
         (is (str/includes? content "qubit[2] data;"))
-        (is (str/includes? content "h data;")))
+        (is (str/includes? content "h data[0];")))
       (stop-app!)
       (is (= 1 @unsubscribed)))))
+
+(defn- thenable [result]
+  #js {:then (fn [callback] (thenable (callback result)))
+       :catch (fn [_] (thenable nil))})
+
+(defn- open-api [calls callbacks unsubscribed result]
+  #js {:openQasm (fn []
+                   (swap! calls conj true)
+                   (thenable result))
+       :onMenuOpen (fn [callback]
+                     (swap! callbacks conj callback)
+                     (fn [] (swap! unsubscribed inc)))})
+
+(deftest open-qasm-menu-test
+  (testing "the File Open menu draws an imported circuit automatically"
+    (let [calls (atom [])
+          callbacks (atom [])
+          unsubscribed (atom 0)
+          content (str "OPENQASM 3.0;\n"
+                       "include \"stdgates.inc\";\n"
+                       "qubit[2] data;\n"
+                       "h data[0];\n")]
+      (reset-app-with-api! (open-api calls callbacks unsubscribed
+                                     #js {:canceled false
+                                          :filePath "circuit.qasm"
+                                          :content content}))
+      (is (= 1 (count @callbacks)))
+      ((first @callbacks))
+      (is (= 1 (count @calls)))
+      (is (= "data (2 qubits)" (.-textContent (select ".canvas-register"))))
+      (is (= "H" (.-textContent (select ".canvas-gate"))))
+      (is (= 1 (count (select-all ".canvas-wire"))))
+      (stop-app!)
+      (is (= 1 @unsubscribed))))
+
+  (testing "cancelling the file dialog leaves the current circuit unchanged"
+    (let [calls (atom [])
+          callbacks (atom [])
+          unsubscribed (atom 0)]
+      (reset-app-with-api! (open-api calls callbacks unsubscribed
+                                     #js {:canceled true}))
+      (drop-component! :h 100 100)
+      ((first @callbacks))
+      (is (= 1 (count @calls)))
+      (is (= 1 (count (select-all ".canvas-gate")))))))
 
 (defn- double-click! [target]
   (.dispatchEvent target (mouse-event "dblclick" {})))
 
-(defn- submit-gate-targets! []
-  (.dispatchEvent (select "#gate-target-form")
+(defn- item-ports [item-id kind]
+  (vec (array-seq (.querySelectorAll (select (str "[data-item-id=\"" item-id "\"]"))
+                                     (str "[data-port-kind=\"" kind "\"]")))))
+
+(defn- port-node [item-id kind index]
+  (first (filter #(= (str index) (.getAttribute % "data-port-index"))
+                 (item-ports item-id kind))))
+
+(defn- submit-gate-qubits! [qubits]
+  (set! (.-value (select "#gate-qubits")) qubits)
+  (.dispatchEvent (select "#gate-qubits-form")
                   (js/window.Event. "submit" #js {:bubbles true :cancelable true})))
 
-(defn- checked-qubits []
-  (->> (select-all "[data-qubit-index]")
-       (filter #(.-checked %))
-       (mapv (fn [input]
-               [(js/parseInt (.getAttribute input "data-register-id") 10)
-                (js/parseInt (.getAttribute input "data-qubit-index") 10)]))))
+(defn- submit-custom! [qubits qasm]
+  (set! (.-value (select "#custom-qubits")) qubits)
+  (set! (.-value (select "#custom-qasm")) qasm)
+  (.dispatchEvent (select "#custom-form")
+                  (js/window.Event. "submit" #js {:bubbles true :cancelable true})))
 
-(deftest gate-target-dialog-test
-  (testing "double clicking a wired gate selects qubits from its register"
+(defn- wire-between-ports!
+  [from-id from-index to-id to-index]
+  (ensure-wire-tool!)
+  (mouse-down! (port-node from-id "output" from-index)
+               {:clientX 0 :clientY 0})
+  (mouse-up-on! (port-node from-id "output" from-index)
+                {:clientX 0 :clientY 0})
+  (mouse-down! (port-node to-id "input" to-index)
+               {:clientX 0 :clientY 0})
+  (mouse-up-on! (port-node to-id "input" to-index)
+                {:clientX 0 :clientY 0}))
+
+(deftest gate-qubits-dialog-test
+  (testing "double clicking a gate opens a number-only dialog"
+    (drop-component! :h 100 100)
+    (double-click! (select "[data-item-id=\"1\"]"))
+    (is (some? (select "#gate-qubits-form")))
+    (is (nil? (select "[data-qubit-index]")))
+    (is (= "1" (.-value (select "#gate-qubits"))))
+    (submit-gate-qubits! "2")
+    (is (nil? (select "#gate-qubits-form")))
+    (is (= 2 (count (item-ports 1 "input"))))
+    (is (= 2 (count (item-ports 1 "output")))))
+
+  (testing "invalid counts keep the dialog open with an error"
+    (reset-app!)
+    (drop-component! :h 100 100)
+    (double-click! (select "[data-item-id=\"1\"]"))
+    (submit-gate-qubits! "0")
+    (is (some? (select "#gate-qubits-form")))
+    (is (= "Number of qubits must be a positive whole number."
+           (.-textContent (select ".dialog-error"))))
+    (is (= 1 (count (item-ports 1 "input"))))))
+
+(deftest custom-gate-dialog-test
+  (testing "dropping the custom component opens its configuration dialog"
+    (drop-component! :custom 100 100)
+    (is (some? (select "#custom-form")))
+    (is (= "1" (.-value (select "#custom-qubits"))))
+    (is (= "" (.-value (select "#custom-qasm"))))
+    (is (= 0 (count (select-all ".canvas-item"))))
+    (is (= "dialog" (.getAttribute (select ".dialog") "role"))))
+
+  (testing "submitting a valid definition places a custom gate with ports"
+    (submit-custom! "2" "gate pair a, b {\n  h a;\n  cx a, b;\n}")
+    (let [gate (select ".canvas-gate")]
+      (is (nil? (select "#custom-form")))
+      (is (some? gate))
+      (is (= "Custom" (.-textContent gate)))
+      (is (= 2 (count (item-ports 1 "input"))))
+      (is (= 2 (count (item-ports 1 "output"))))))
+
+  (testing "an invalid definition keeps the dialog open with an error"
+    (reset-app!)
+    (drop-component! :custom 100 100)
+    (submit-custom! "0" " ")
+    (is (some? (select "#custom-form")))
+    (is (= "0" (.-value (select "#custom-qubits"))))
+    (is (= " " (.-value (select "#custom-qasm"))))
+    (is (some? (select ".dialog-error")))
+    (is (= 0 (count (select-all ".canvas-item")))))
+
+  (testing "cancelling closes the dialog without adding a gate"
+    (reset-app!)
+    (drop-component! :custom 100 100)
+    (.click (select "#custom-cancel"))
+    (is (nil? (select "#custom-form")))
+    (is (= 0 (count (select-all ".canvas-item"))))))
+
+(deftest custom-gate-edit-test
+  (testing "double clicking a custom gate reopens its definition dialog"
+    (drop-component! :custom 100 100)
+    (submit-custom! "2" "gate pair a, b { h a; }")
+    (double-click! (select "[data-item-id=\"1\"]"))
+    (is (some? (select "#custom-form")))
+    (is (= "2" (.-value (select "#custom-qubits"))))
+    (is (= "gate pair a, b { h a; }" (.-value (select "#custom-qasm"))))
+    (submit-custom! "1" "gate solo q { x q; }")
+    (is (nil? (select "#custom-form")))
+    (is (= 1 (count (item-ports 1 "input"))))
+    (is (= 1 (count (select-all ".canvas-gate"))))))
+
+(deftest custom-gate-save-test
+  (testing "saving emits the custom definition and one call with wired operands"
     (let [calls (atom [])
           callbacks (atom [])
           unsubscribed (atom 0)]
       (reset-app-with-api! (save-api calls callbacks unsubscribed))
       (drop-component! :quantum-register 40 40)
-      (submit-register! "data" "3")
-      (drop-component! :h 200 40)
-      (draw-wire! 1 2 40 40 200 40)
-      (toggle-wire-tool!)
-      (double-click! (select "[data-item-id=\"2\"]"))
-      (is (some? (select "#gate-target-form")))
-      (is (= ["0" "1" "2"]
-             (mapv #(.getAttribute % "data-qubit-index")
-                   (select-all "[data-qubit-index]"))))
-      (is (= [[1 0] [1 1] [1 2]] (checked-qubits)))
-      (set! (.-checked (select "[data-qubit-index=\"1\"]")) false)
-      (submit-gate-targets!)
-      (is (nil? (select "#gate-target-form")))
+      (submit-register! "data" "2")
+      (drop-component! :custom 240 40)
+      (submit-custom! "2" "gate bell a, b {\n  h a;\n  cx a, b;\n}")
+      (wire-between-ports! 1 0 2 0)
+      (wire-between-ports! 1 1 2 1)
       ((first @callbacks))
       (let [[content] (first @calls)]
-        (is (str/includes? content "h data[0];"))
-        (is (str/includes? content "h data[2];"))
-        (is (not (str/includes? content "h data[1];")))))))
+        (is (str/includes? content "gate bell a, b {"))
+        (is (str/includes? content "bell data[0], data[1];"))))))
+
+(deftest incomplete-custom-gate-save-test
+  (testing "saving an incompletely wired custom gate omits the invalid call"
+    (let [calls (atom [])
+          callbacks (atom [])
+          unsubscribed (atom 0)]
+      (reset-app-with-api! (save-api calls callbacks unsubscribed))
+      (drop-component! :quantum-register 40 40)
+      (submit-register! "register_1" "2")
+      (drop-component! :custom 240 40)
+      (submit-custom! "2" "gate pair a, b {\n  h a;\n  cx a, b;\n}")
+      (wire-between-ports! 1 0 2 0)
+      ((first @callbacks))
+      (let [[content] (first @calls)]
+        (is (str/includes? content "gate pair a, b {"))
+        (is (not (str/includes? content "pair register_1[0];")))
+        (is (str/includes? content "1 of 2 qubits connected"))))))
 
 (deftest gate-multi-register-target-test
-  (testing "a gate can target qubits from more than one register"
+  (testing "a gate can target qubits from more than one register by port order"
     (let [calls (atom [])
           callbacks (atom [])
           unsubscribed (atom 0)]
@@ -766,46 +914,14 @@
       (drop-component! :quantum-register 40 140)
       (submit-register! "b" "2")
       (drop-component! :h 240 40)
-      (toggle-wire-tool!)
-      (doseq [[from-id to-id from-x from-y to-x to-y]
-              [[1 3 40 40 240 40]
-               [2 3 40 140 240 40]]]
-        (mouse-down! (select (str "[data-item-id=\"" from-id "\"]"))
-                     {:clientX from-x :clientY from-y})
-        (mouse-move! {:clientX to-x :clientY to-y})
-        (mouse-up-on! (select (str "[data-item-id=\"" to-id "\"]"))
-                      {:clientX to-x :clientY to-y}))
-      (toggle-wire-tool!)
       (double-click! (select "[data-item-id=\"3\"]"))
-      (doseq [input (select-all "[data-qubit-index]")]
-        (set! (.-checked input) false))
-      (set! (.-checked (select "[data-register-id=\"1\"][data-qubit-index=\"1\"]")) true)
-      (set! (.-checked (select "[data-register-id=\"2\"][data-qubit-index=\"0\"]")) true)
-      (submit-gate-targets!)
+      (submit-gate-qubits! "2")
+      (wire-between-ports! 1 1 3 0)
+      (wire-between-ports! 2 0 3 1)
       ((first @callbacks))
       (let [[content] (first @calls)]
         (is (str/includes? content "h a[1];"))
         (is (str/includes? content "h b[0];"))))))
-
-(deftest gate-target-dialog-validation-test
-  (testing "unconnected gates do not open the target dialog"
-    (drop-component! :h 100 100)
-    (double-click! (select "[data-item-id=\"1\"]"))
-    (is (nil? (select "#gate-target-form"))))
-
-  (testing "submitting no qubits keeps the dialog open with an error"
-    (reset-app!)
-    (drop-component! :quantum-register 40 40)
-    (submit-register! "data" "2")
-    (drop-component! :h 200 40)
-    (draw-wire! 1 2 40 40 200 40)
-    (toggle-wire-tool!)
-    (double-click! (select "[data-item-id=\"2\"]"))
-    (doseq [input (select-all "[data-qubit-index]")]
-      (set! (.-checked input) false))
-    (submit-gate-targets!)
-    (is (some? (select "#gate-target-form")))
-    (is (= "Select at least one qubit." (.-textContent (select ".dialog-error"))))))
 
 (deftest selection-mousedown-test
   (testing "selecting an item updates classes without replacing its node"
@@ -814,3 +930,73 @@
       (mouse-down! node {:clientX 100 :clientY 100})
       (is (identical? node (select "[data-item-id=\"1\"]")))
       (is (.contains (.-classList node) "selected")))))
+
+(deftest register-output-ports-test
+  (testing "a register shows one output port per qubit"
+    (drop-component! :quantum-register 40 40)
+    (submit-register! "data" "3")
+    (let [ports (item-ports 1 "output")]
+      (is (= 3 (count ports)))
+      (is (= ["0" "1" "2"] (mapv #(.getAttribute % "data-port-index") ports)))
+      (is (empty? (item-ports 1 "input"))))))
+
+(deftest wire-port-snapping-test
+  (testing "wires start and end on the clicked ports"
+    (drop-component! :quantum-register 40 40)
+    (submit-register! "data" "3")
+    (drop-component! :h 200 40)
+    (wire-between-ports! 1 1 2 0)
+    (let [wire (select ".canvas-wire:not(.canvas-wire-draft)")]
+      (is (some? wire))
+      (is (= "1" (.getAttribute wire "data-from-port")))
+      (is (= "0" (.getAttribute wire "data-to-port")))
+      (is (nil? (select "#wire-draft"))))))
+
+(deftest wire-driven-multi-qubit-target-test
+  (testing "one register wire targets one qubit; more ports allow more wires"
+    (let [calls (atom [])
+          callbacks (atom [])
+          unsubscribed (atom 0)]
+      (reset-app-with-api! (save-api calls callbacks unsubscribed))
+      (drop-component! :quantum-register 40 40)
+      (submit-register! "data" "3")
+      (drop-component! :h 200 40)
+      (wire-between-ports! 1 0 2 0)
+      (toggle-wire-tool!)
+      (double-click! (select "[data-item-id=\"2\"]"))
+      (submit-gate-qubits! "2")
+      (is (= 2 (count (item-ports 2 "input"))))
+      (is (= 2 (count (item-ports 2 "output"))))
+      (wire-between-ports! 1 1 2 1)
+      (toggle-wire-tool!)
+      ((first @callbacks))
+      (let [[content] (first @calls)]
+        (is (str/includes? content "h data[0];"))
+        (is (str/includes? content "h data[1];"))
+        (is (not (str/includes? content "h data;")))))))
+
+(deftest gate-ports-test
+  (testing "gates grow ports to match their configured qubit count"
+    (drop-component! :h 200 40)
+    (is (= 1 (count (item-ports 1 "input"))))
+    (is (= 1 (count (item-ports 1 "output"))))
+    (double-click! (select "[data-item-id=\"1\"]"))
+    (submit-gate-qubits! "2")
+    (is (= 2 (count (item-ports 1 "input"))))
+    (is (= 2 (count (item-ports 1 "output"))))))
+
+(deftest gate-qubit-count-shrink-test
+  (testing "shrinking a gate removes overflow ports and their wires"
+    (drop-component! :quantum-register 40 40)
+    (submit-register! "data" "3")
+    (drop-component! :h 200 40)
+    (double-click! (select "[data-item-id=\"2\"]"))
+    (submit-gate-qubits! "2")
+    (wire-between-ports! 1 0 2 0)
+    (wire-between-ports! 1 1 2 1)
+    (toggle-wire-tool!)
+    (is (= 2 (count (item-ports 2 "input"))))
+    (double-click! (select "[data-item-id=\"2\"]"))
+    (submit-gate-qubits! "1")
+    (is (= 1 (count (item-ports 2 "input"))))
+    (is (= 1 (count (select-all ".canvas-wire:not(.canvas-wire-draft)"))))))

@@ -9,6 +9,11 @@ function createApplicationMenu(win) {
       label: "File",
       submenu: [
         {
+          label: "Open...",
+          accelerator: "CmdOrCtrl+O",
+          click: () => win.webContents.send("menu-open")
+        },
+        {
           label: "Save",
           accelerator: "CmdOrCtrl+S",
           click: () => win.webContents.send("menu-save")
@@ -51,6 +56,26 @@ function createWindow() {
 
 app.whenReady().then(() => {
   ipcMain.handle("ping", () => "pong from Electron");
+
+  ipcMain.handle("open-qasm", async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const { canceled, filePaths } = await dialog.showOpenDialog(win, {
+      title: "Open OpenQASM circuit",
+      properties: ["openFile"],
+      filters: [
+        { name: "OpenQASM", extensions: ["qasm"] },
+        { name: "All files", extensions: ["*"] }
+      ]
+    });
+
+    if (canceled || !filePaths || filePaths.length === 0) {
+      return { canceled: true };
+    }
+
+    const filePath = filePaths[0];
+    const content = await fs.readFile(filePath, "utf8");
+    return { canceled: false, filePath, content };
+  });
 
   ipcMain.handle("save-qasm", async (event, payload = {}) => {
     const content = payload && typeof payload.content === "string"

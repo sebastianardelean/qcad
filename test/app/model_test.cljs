@@ -920,3 +920,412 @@
 
   (testing "an unknown item has no free ports"
     (is (nil? (model/free-port-index model/initial-state 99 :output)))))
+
+
+(deftest multi-qubit-defaults-test
+  (testing "multi-qubit gates are inserted with their default arity"
+    (is (= 2 (get-in (model/handle-drop model/initial-state :cx 0 0)
+                     [:items 0 :qubits])))
+    (is (= 2 (get-in (model/handle-drop model/initial-state :cz 0 0)
+                     [:items 0 :qubits])))
+    (is (= 2 (get-in (model/handle-drop model/initial-state :swap 0 0)
+                     [:items 0 :qubits])))
+    (is (= 3 (get-in (model/handle-drop model/initial-state :ccx 0 0)
+                     [:items 0 :qubits])))))
+
+(deftest classical-register-test
+  (testing "classical registers are opened from the classical component"
+    (let [state (model/handle-drop model/initial-state :classical-register 0 0)]
+      (is (true? (get-in state [:dialog :classical])))
+      (is (= "register-1" (get-in state [:dialog :name])))))
+
+  (testing "confirming a classical register stores its kind and ports"
+    (let [state (-> model/initial-state
+                    (model/handle-drop :classical-register 0 0)
+                    (model/confirm-register "c" "2"))
+          register (first (:items state))]
+      (is (= :classical-register (:component register)))
+      (is (true? (:classical register)))
+      (is (= 2 (model/port-count register :input)))
+      (is (= 0 (model/port-count register :output)))
+      (is (model/classical-register? register)))))
+
+(deftest gate-controls-test
+  (testing "controls extend the gate port count"
+    (let [state (model/handle-drop model/initial-state :h 0 0)
+          state (model/set-gate-controls state 1 1)
+          gate (first (:items state))]
+      (is (= 1 (model/gate-control-count gate)))
+      (is (= 2 (model/gate-port-count gate)))
+      (is (= 2 (model/port-count gate :input)))
+      (is (= 2 (model/port-count gate :output)))))
+
+  (testing "controls can be toggled and cleared"
+    (let [state (-> model/initial-state
+                    (model/handle-drop :h 0 0)
+                    (model/toggle-gate-control 1))]
+      (is (= 1 (model/gate-control-count (first (:items state)))))
+      (let [state (model/toggle-gate-control state 1)]
+        (is (= 0 (model/gate-control-count (first (:items state))))))
+      (let [state (model/set-gate-controls state 1 -3)]
+        (is (= 0 (model/gate-control-count (first (:items state)))))))))
+
+(deftest gate-dialog-shape-test
+  (testing "qubits, angle and controls are applied together"
+    (let [state (-> model/initial-state
+                    (model/handle-drop :rx 0 0)
+                    (model/open-gate-qubits-dialog 1)
+                    (model/confirm-gate-qubits "3" "pi/4" "2"))
+          gate (first (:items state))]
+      (is (= 3 (:qubits gate)))
+      (is (= "pi/4" (:angle gate)))
+      (is (= 2 (:controls gate)))
+      (is (nil? (:dialog state)))))
+
+  (testing "invalid qubit counts keep the dialog open"
+    (let [state (-> model/initial-state
+                    (model/handle-drop :h 0 0)
+                    (model/open-gate-qubits-dialog 1)
+                    (model/confirm-gate-qubits "0"))]
+      (is (some? (:dialog state)))
+      (is (string? (get-in state [:dialog :error])))))
+
+  (testing "angles are only kept on parameterised gates"
+    (let [state (-> model/initial-state
+                    (model/handle-drop :h 0 0)
+                    (model/open-gate-qubits-dialog 1)
+                    (model/confirm-gate-qubits "1" "pi/2"))]
+      (is (nil? (get-in state [:items 0 :angle]))))))
+
+(deftest measure-targets-test
+  (let [state (-> model/initial-state
+                  (model/add-item {:id 1 :type :register :component :quantum-register
+                                   :name "q" :qubits 2 :x 0 :y 0})
+                  (model/add-item {:id 2 :type :register :component :classical-register
+                                   :classical true :name "c" :qubits 2 :x 0 :y 200})
+                  (model/add-item {:id 3 :type :gate :component :measure :qubits 1
+                                   :x 200 :y 0})
+                  (model/add-wire 1 3 nil
+                                  {:kind :output :index 0}
+                                  {:kind :input :index 0})
+                  (model/add-wire 3 2 nil
+                                  {:kind :output :index 0}
+                                  {:kind :input :index 1}))]
+    (is (= [[1 0] [2 1]] (model/measure-targets state 3)))
+    (is (= [[2 1]] (model/classical-targets state 3)))
+    (is (= {:from 3 :to 2 :id 2
+            :from-port {:kind :output :index 0}
+            :to-port {:kind :input :index 1}}
+           (model/output-target state 3 0)))))
+
+(deftest history-test
+  (let [s0 model/initial-state
+        s1 (model/handle-drop s0 :h 0 0)
+        s1 (model/append-history s0 s1)
+        s2 (model/handle-drop s1 :x 200 0)
+        s2 (model/append-history s1 s2)
+        undone (model/undo s2)
+        redone (model/redo undone)]
+    (is (= 2 (count (:items s2))))
+    (is (model/can-undo? s2))
+    (is (not (model/can-redo? s2)))
+    (is (= [:h] (mapv :component (:items undone))))
+    (is (model/can-redo? undone))
+    (is (= [:h :x] (mapv :component (:items redone))))
+    (is (not (model/can-undo? (model/undo s0))))))
+
+(deftest clipboard-test
+  (let [state (-> model/initial-state
+                  (model/add-item {:id 1 :type :register :component :quantum-register
+                                   :name "q" :qubits 2 :x 0 :y 0})
+                  (model/add-item {:id 2 :type :gate :component :h :x 100 :y 0})
+                  (model/add-item {:id 3 :type :gate :component :x :x 200 :y 0})
+                  (model/add-wire 1 2 nil
+                                  {:kind :output :index 0}
+                                  {:kind :input :index 0})
+                  (model/add-wire 2 3 nil
+                                  {:kind :output :index 0}
+                                  {:kind :input :index 0})
+                  (model/select-item 2)
+                  (model/toggle-selection 3)
+                  (model/copy-selection)
+                  (model/paste-clipboard 400 100))
+        pasted (filter #(>= (:id %) 4) (:items state))
+        new-wires (filter #(>= (:id %) 3) (:wires state))]
+    (is (= [4 5] (mapv :id pasted)))
+    (is (= [400 500] (mapv :x pasted)))
+    (is (= [100 100] (mapv :y pasted)))
+    (is (= #{4 5} (:selected state)))
+    (is (= [{:id 3 :from 4 :to 5
+             :from-port {:kind :output :index 0}
+             :to-port {:kind :input :index 0}}]
+           (mapv #(select-keys % [:id :from :to :from-port :to-port]) new-wires)))
+    (is (= model/initial-state
+           (model/paste-clipboard model/initial-state 0 0)))))
+
+(deftest duplicate-selection-test
+  (let [state (-> model/initial-state
+                  (model/handle-drop :h 100 100)
+                  (model/select-item 1)
+                  (model/duplicate-selection))]
+    (is (= 2 (count (:items state))))
+    (is (= [1 2] (mapv :id (:items state))))
+    (is (= #{2} (:selected state)))))
+
+(deftest canvas-preferences-test
+  (testing "theme, search and snap size are normalised"
+    (is (= :light (:theme model/initial-state)))
+    (is (= :dark (:theme (model/toggle-theme model/initial-state))))
+    (is (= :light (:theme (model/toggle-theme
+                           (model/set-theme model/initial-state :dark)))))
+    (is (= :light (:theme (model/set-theme model/initial-state :sepia))))
+    (is (= "" (:component-search (model/set-component-search model/initial-state nil))))
+    (is (= "bell" (:component-search (model/set-component-search model/initial-state "bell"))))
+    (is (= 40 (:snap-size (model/set-snap-size model/initial-state 40))))
+    (is (= (:snap-size model/initial-state)
+           (:snap-size (model/set-snap-size model/initial-state -1))))))
+
+(deftest annotation-and-metadata-test
+  (testing "annotations are added through their dialog"
+    (let [state (-> model/initial-state
+                    (model/handle-drop :annotation 0 0)
+                    (model/confirm-annotation "  hello  "))]
+      (is (= "hello" (get-in state [:items 0 :text])))
+      (is (= :annotation (get-in state [:items 0 :type])))
+      (is (nil? (:dialog state)))))
+
+  (testing "blank annotations are rejected"
+    (let [state (-> model/initial-state
+                    (model/handle-drop :annotation 0 0)
+                    (model/confirm-annotation "   "))]
+      (is (string? (get-in state [:dialog :error])))
+      (is (empty? (:items state)))))
+
+  (testing "metadata is trimmed and stored"
+    (let [state (-> model/initial-state
+                    (model/open-metadata-dialog)
+                    (model/confirm-metadata {:name " Bell "
+                                             :author " Ada "
+                                             :description " test "
+                                             :ignored "x"}))]
+      (is (= {:name "Bell" :author "Ada" :description "test"}
+             (:metadata state)))
+      (is (nil? (:dialog state))))))
+
+(deftest component-snap-test
+  (testing "component snapping is disabled by default and can be toggled"
+    (is (false? (:snap-components model/initial-state)))
+    (is (true? (:snap-components (model/toggle-component-snap model/initial-state))))
+    (is (false? (:snap-components
+                 (-> model/initial-state
+                     model/toggle-component-snap
+                     model/toggle-component-snap)))))
+
+  (testing "a moving item aligns to a nearby static item edge"
+    (let [state (-> model/initial-state
+                    model/toggle-snap
+                    model/toggle-component-snap
+                    (assoc :items [{:id 1 :type :gate :component :h :x 150 :y 0}
+                                   {:id 2 :type :gate :component :x :x 100 :y 0}]))
+          moved (model/move-items state {1 [150 0]} -5 0)]
+      (is (= [144 0] ((juxt :x :y) (first (:items moved)))))))
+
+  (testing "items further than the alignment threshold are left alone"
+    (let [state (-> model/initial-state
+                    model/toggle-snap
+                    model/toggle-component-snap
+                    (assoc :items [{:id 1 :type :gate :component :h :x 200 :y 0}
+                                   {:id 2 :type :gate :component :x :x 100 :y 0}]))
+          moved (model/move-items state {1 [200 0]} -5 0)]
+      (is (= [195 0] ((juxt :x :y) (first (:items moved)))))))
+
+  (testing "the vertical axis aligns independently"
+    (let [state (-> model/initial-state
+                    model/toggle-snap
+                    model/toggle-component-snap
+                    (assoc :items [{:id 1 :type :gate :component :h :x 300 :y 95}
+                                   {:id 2 :type :gate :component :x :x 100 :y 50}]))
+          moved (model/move-items state {1 [300 95]} 0 -5)]
+      (is (= [300 86] ((juxt :x :y) (first (:items moved))))))))
+
+
+(deftest coverage-edges-test
+  (testing "marquee and item bounds handle every item type and reversed drags"
+    (is (= [10 20 30 40] (model/marquee-rect {:start [30 40] :current [10 20]})))
+    (is (= [1 2 45 38] (model/item-bounds {:x 1 :y 2 :type :gate})))
+    (is (= [1 2 161 38] (model/item-bounds {:x 1 :y 2 :type :register})))
+    (is (= [1 2 141 32] (model/item-bounds {:x 1 :y 2 :type :annotation})))
+    (is (= [1 2 221 142] (model/item-bounds {:x 1 :y 2 :type :box})))
+    (is (= [1 2 9 10] (model/item-bounds {:x 1 :y 2 :width 8 :height 8 :type :gate}))))
+
+  (testing "gate and port counts tolerate malformed values"
+    (is (= 1 (model/gate-target-count {})))
+    (is (= 2 (model/gate-target-count {:qubits 2})))
+    (is (= 0 (model/gate-control-count {})))
+    (is (= 2 (model/gate-control-count {:controls 2})))
+    (is (= 3 (model/gate-port-count {:qubits 2 :controls 1})))
+    (is (false? (model/classical-register? {:type :register})))
+    (is (true? (model/classical-register? {:classical true})))
+    (is (= 2 (model/port-count {:type :register :qubits 2} :output)))
+    (is (= 0 (model/port-count {:type :register :qubits 2} :input)))
+    (is (= 2 (model/port-count {:type :register :classical true :qubits 2} :input)))
+    (is (= 0 (model/port-count {:type :register :classical true :qubits 2} :output)))
+    (is (= 2 (model/port-count {:type :gate :qubits 1 :controls 1} :input)))
+    (is (= 0 (model/port-count {:type :annotation} :input)))
+    (is (= 0 (model/port-count {:type :gate} :side))))
+
+  (testing "wire drafting and cancellation edge cases"
+    (is (= model/initial-state (model/update-wire-draft model/initial-state 1 2)))
+    (is (= model/initial-state (model/add-wire-point model/initial-state 1 2)))
+    (is (= model/initial-state (model/cancel-wire-draft model/initial-state)))
+    (is (= model/initial-state (model/finish-wire model/initial-state 1)))
+    (let [state (model/start-wire-draft model/initial-state 1 5 6
+                                        {:kind :output :index 0})]
+      (is (= {:from 1 :x 5 :y 6 :points [] :from-port {:kind :output :index 0}}
+             (:wire-draft state)))
+      (is (= 7 (get-in (model/update-wire-draft state 7 8) [:wire-draft :x])))
+      (let [with-points (-> state
+                            (model/add-wire-point 10 10)
+                            (model/add-wire-point 10 10))]
+        (is (= [[10 10]] (get-in with-points [:wire-draft :points]))))))
+
+  (testing "invalid and duplicate wires are ignored"
+    (let [base (-> model/initial-state
+                   (model/add-item {:id 1 :type :register :component :quantum-register
+                                    :name "q" :qubits 2 :x 0 :y 0})
+                   (model/add-item {:id 2 :type :gate :component :h :x 100 :y 0})
+                   (model/add-item {:id 3 :type :gate :component :x :x 200 :y 0})
+                   (model/add-item {:id 4 :type :register :component :quantum-register
+                                    :name "r" :qubits 2 :x 0 :y 200}))]
+      (is (empty? (:wires (model/add-wire base 1 1))))
+      (is (empty? (:wires (model/add-wire base 1 99))))
+      (is (empty? (:wires (model/add-wire base 1 4))))
+      (is (empty? (:wires (model/add-wire base 1 2 nil
+                                          {:kind :input :index 0}
+                                          {:kind :input :index 0}))))
+      (is (empty? (:wires (model/add-wire base 1 2 nil
+                                          {:kind :output :index 9}
+                                          {:kind :input :index 0}))))
+      (let [wired (model/add-wire base 1 2 nil
+                                  {:kind :output :index 0}
+                                  {:kind :input :index 0})]
+        (is (= 1 (count (:wires wired))))
+        (is (= 1 (count (:wires (model/add-wire wired 1 2 nil
+                                                            {:kind :output :index 0}
+                                                            {:kind :input :index 0})))))
+        (is (= 1 (count (:wires (model/add-wire wired 2 1 nil
+                                                            {:kind :output :index 0}
+                                                            {:kind :input :index 0}))))))))
+
+  (testing "context menus, rotations, and dialogs"
+    (let [state (-> model/initial-state
+                    (model/add-item {:id 1 :type :gate :component :rx :x 0 :y 0})
+                    (model/add-item {:id 2 :type :gate :component :h :x 100 :y 0})
+                    (model/add-item {:id 3 :type :annotation :component :annotation
+                                     :text "old" :x 0 :y 100})
+                    (model/add-item {:id 4 :type :box :component :box
+                                     :text "group" :x 0 :y 200}))]
+      (is (= {:item-id 1 :x 5 :y 6} (:context-menu (model/open-context-menu state 1 5 6))))
+      (is (nil? (:context-menu (model/close-context-menu state))))
+      (is (= 90 (get-in (model/rotate-item state 1) [:items 0 :rotation])))
+      (is (= 45 (get-in (model/rotate-item state 1 45) [:items 0 :rotation])))
+      (is (= 0 (get-in (model/rotate-item (model/rotate-item state 1) 1 270)
+                       [:items 0 :rotation])))
+      (is (= :classical (let [s (model/open-register-dialog state 1 2 true)]
+                          (if (get-in s [:dialog :classical]) :classical :quantum))))
+      (is (= 3 (get-in (model/open-annotation-editor state 3) [:dialog :item-id])))
+      (is (= 4 (get-in (model/open-annotation-editor state 4) [:dialog :item-id])))
+      (is (= state (model/open-annotation-editor state 2)))
+      (is (= state (model/open-annotation-editor state 99)))
+      (is (= :metadata (get-in (model/open-metadata-dialog state) [:dialog :type])))
+      (is (= :export (get-in (model/open-export-dialog state) [:dialog :type])))
+      (is (= :library (get-in (model/open-library-dialog state) [:dialog :type])))
+      (is (= :diff (get-in (model/open-diff-dialog state "diff") [:dialog :type])))
+      (is (= state (model/open-gate-qubits-dialog state 3)))
+      (is (= state (model/open-gate-qubits-dialog state 99)))
+      (is (= "1" (get-in (model/open-gate-qubits-dialog
+                          (model/set-gate-controls state 1 0) 1)
+                         [:dialog :qubits])))
+      (is (= "1" (get-in (model/open-gate-qubits-dialog
+                          (model/set-gate-controls state 2 1) 2)
+                         [:dialog :controls])))))
+
+  (testing "gate qubit confirmation validates and applies optional fields"
+    (let [base (-> model/initial-state
+                   (model/add-item {:id 1 :type :gate :component :rx :x 0 :y 0})
+                   (model/add-item {:id 2 :type :gate :component :cx :qubits 2 :x 0 :y 0})
+                   (model/open-gate-qubits-dialog 1))]
+      (is (= model/initial-state (model/confirm-gate-qubits model/initial-state "1")))
+      (is (= 2 (get-in (model/open-gate-qubits-dialog base 2) [:dialog :gate-id])))
+      (is (= "2" (get-in (model/open-gate-qubits-dialog base 2) [:dialog :qubits])))
+      (let [confirmed (model/confirm-gate-qubits base "3" "pi" "0")]
+        (is (= 3 (get-in confirmed [:items 0 :qubits])))
+        (is (= "pi" (get-in confirmed [:items 0 :angle])))
+        (is (nil? (get-in confirmed [:dialog]))))
+      (let [bad (model/confirm-gate-qubits base "0")]
+        (is (string? (get-in bad [:dialog :error])))))
+    (let [custom (-> model/initial-state
+                     (model/open-custom-dialog 0 0))]
+      (is (= model/initial-state (model/confirm-custom-gate model/initial-state "1" "gate x {}")))
+      (is (string? (get-in (model/confirm-custom-gate custom "0" "") [:dialog :qubits])))))
+
+  (testing "register, annotation, and box edge cases"
+    (let [classical (model/open-register-dialog model/initial-state 0 0 true)
+          confirmed (model/confirm-register classical " c " "2")]
+      (is (true? (get-in confirmed [:items 0 :classical])))
+      (is (= :classical-register (get-in confirmed [:items 0 :component]))))
+    (let [state (-> model/initial-state
+                    (model/handle-drop :box 10 20))]
+      (is (= :box (get-in state [:items 0 :type])))
+      (is (= "Group" (get-in state [:items 0 :text]))))
+    (let [edited (model/confirm-annotation
+                  (assoc model/initial-state
+                         :items [{:id 1 :type :annotation :component :annotation
+                                  :text "old" :x 0 :y 0}]
+                         :dialog {:type :annotation :item-id 1
+                                  :x 0 :y 0 :text "old" :error nil})
+                  " new ")]
+      (is (= "new" (get-in edited [:items 0 :text])))
+      (is (nil? (:dialog edited))))
+    (is (= model/initial-state (model/confirm-annotation model/initial-state "x")))
+    (is (nil? (:dialog (model/confirm-annotation
+                        (assoc model/initial-state :dialog {:type :annotation
+                                                            :x 0 :y 0 :text "" :error nil})
+                        "x"))))
+    (is (= model/initial-state (model/confirm-register model/initial-state "q" "1")))
+    (is (= model/initial-state (model/confirm-metadata model/initial-state {})))
+    (is (nil? (:dialog (model/cancel-dialog
+                        (assoc model/initial-state :dialog {:type :x})))))
+    (is (= model/initial-state (model/cancel-dialog model/initial-state)))
+    (is (= model/initial-state (model/cancel-register model/initial-state))))
+
+  (testing "history, clipboard, and view helpers cover fallback paths"
+    (is (= {:items [] :wires [] :next-id 1 :next-wire-id 1
+            :metadata {:name "" :author "" :description ""}
+            :includes ["stdgates.inc"] :raw-statements []}
+           (model/snapshot model/initial-state)))
+    (is (nil? (model/selection-snapshot model/initial-state)))
+    (is (= model/initial-state (model/copy-selection model/initial-state)))
+    (is (= model/initial-state (model/paste-clipboard model/initial-state 0 0)))
+    (is (= model/initial-state (model/duplicate-selection model/initial-state)))
+    (is (= model/initial-state (model/set-clipboard model/initial-state nil)))
+    (is (= {:a 1} (:clipboard (model/set-clipboard model/initial-state {:a 1}))))
+    (is (= model/initial-state (model/paste-snapshot model/initial-state {} 0 0)))
+    (is (= model/initial-state (model/paste-snapshot
+                                model/initial-state {:items [] :wires []} 0 0)))
+    (is (= model/initial-state (model/redo model/initial-state)))
+    (is (= model/initial-state (model/undo model/initial-state)))
+    (is (false? (model/can-undo? model/initial-state)))
+    (is (false? (model/can-redo? model/initial-state)))
+    (is (= {:pan-x 0 :pan-y 0 :zoom 1} (:view (model/fit-view model/initial-state))))
+    (let [fit (model/fit-view (assoc model/initial-state
+                                     :items [{:id 1 :type :gate :component :h
+                                              :x 100 :y 100}])
+                              100 100)]
+      (is (pos? (get-in fit [:view :zoom]))))
+    (is (= 4 (get-in (model/fit-view (assoc model/initial-state
+                                            :items [{:id 1 :type :gate :component :h
+                                                     :x 0 :y 0}])
+                                     100000 100000)
+                     [:view :zoom])))))
+

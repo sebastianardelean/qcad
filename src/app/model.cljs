@@ -14,17 +14,33 @@
    :wire-draft nil
    :view {:pan-x 0 :pan-y 0 :zoom 1}
    :snap true
+   :snap-components false
    :snap-size 20
    :cursor nil
-   :marquee nil})
+   :marquee nil
+   :metadata {:name "" :author "" :description ""}
+   :includes ["stdgates.inc"]
+   :raw-statements []
+   :history []
+   :history-index -1
+   :clipboard nil
+   :component-search ""
+   :theme :light
+   :baseline nil})
 
 (def rotation-step-degrees 90)
 
 (def min-zoom 0.25)
 (def max-zoom 4)
 
+(def history-limit 100)
+(def default-angle "pi/2")
+(def angle-presets ["pi/4" "pi/2" "pi" "2*pi"])
+
 (def ^:private gate-size [44 36])
 (def ^:private register-size [160 36])
+(def ^:private annotation-size [140 30])
+(def ^:private box-size [220 140])
 
 (defn snap-value [value size]
   (* size (js/Math.round (/ value size))))
@@ -37,6 +53,9 @@
 
 (defn toggle-snap [state]
   (update state :snap not))
+
+(defn toggle-component-snap [state]
+  (update state :snap-components not))
 
 (defn screen->world [{:keys [pan-x pan-y zoom]} [sx sy]]
   [(/ (- sx pan-x) zoom)
@@ -90,9 +109,12 @@
     [(min x1 x2) (min y1 y2) (max x1 x2) (max y1 y2)]))
 
 (defn item-bounds [{:keys [x y width height type]}]
-  (let [[default-width default-height] (if (= :register type)
-                                         register-size
-                                         gate-size)]
+  (let [[default-width default-height]
+        (case type
+          :register register-size
+          :annotation annotation-size
+          :box box-size
+          gate-size)]
     [x y
      (+ x (or width default-width))
      (+ y (or height default-height))]))
@@ -159,15 +181,65 @@
 (defn clear-selection [state]
   (assoc state :selected #{}))
 
+(def alignment-threshold 8)
+
+(defn- bounds-of [items]
+  (when (seq items)
+    (let [rects (map item-bounds items)]
+      [(apply min (map first rects))
+       (apply min (map second rects))
+       (apply max (map #(nth % 2) rects))
+       (apply max (map #(nth % 3) rects))])))
+
+(defn- axis-values [[x1 y1 x2 y2] axis]
+  (if (= axis :x)
+    [x1 (/ (+ x1 x2) 2) x2]
+    [y1 (/ (+ y1 y2) 2) y2]))
+
+(defn- best-axis-snap [moving-bounds static-bounds axis]
+  (let [moving (axis-values moving-bounds axis)
+        delta (->> (for [bounds static-bounds
+                         a moving
+                         b (axis-values bounds axis)
+                         :let [delta (- b a)]
+                         :when (<= (js/Math.abs delta) alignment-threshold)]
+                     delta)
+                   (sort-by js/Math.abs)
+                   first)]
+    (or delta 0)))
+
+(defn- component-snap-offset [items moved-ids]
+  (let [moving (filter #(contains? moved-ids (:id %)) items)
+        static (remove #(contains? moved-ids (:id %)) items)]
+    (if (or (empty? moving) (empty? static))
+      [0 0]
+      (let [moving-bounds (bounds-of moving)
+            static-bounds (map item-bounds static)]
+        [(best-axis-snap moving-bounds static-bounds :x)
+         (best-axis-snap moving-bounds static-bounds :y)]))))
+
+(defn- snapped-item [state origins dx dy item]
+  (if-let [[x y] (get origins (:id item))]
+    (let [[snapped-x snapped-y] (snap-point state [(+ x dx) (+ y dy)])]
+      (assoc item :x snapped-x :y snapped-y))
+    item))
+
 (defn move-items [state origins dx dy]
-  (update state :items
-          (fn [items]
-            (mapv (fn [{:keys [id] :as item}]
-                    (if-let [[x y] (get origins id)]
-                      (let [[snapped-x snapped-y] (snap-point state [(+ x dx) (+ y dy)])]
-                        (assoc item :x snapped-x :y snapped-y))
-                      item))
-                  items))))
+  (let [moved-ids (set (keys origins))
+        items (mapv #(snapped-item state origins dx dy %) (:items state))
+        [ax ay] (if (:snap-components state)
+                  (component-snap-offset items moved-ids)
+                  [0 0])]
+    (assoc state :items
+           (if (and (zero? ax) (zero? ay))
+             items
+             (mapv (fn [item]
+                     (if (contains? moved-ids (:id item))
+                       (-> item
+                           (update :x + ax)
+                           (update :y + ay))
+                       item))
+                   items)))))
 
 (defn item-by-id [state item-id]
   (first (filter #(= item-id (:id %)) (:items state))))
@@ -201,15 +273,29 @@
          (sort-by (juxt #(or (:y %) 0) #(or (:x %) 0) #(or (:id %) 0)))
          vec)))
 
-(defn gate-port-count [gate]
+(defn gate-target-count [gate]
   (let [qubits (:qubits gate)]
     (if (and (integer? qubits) (pos? qubits))
       qubits
       1)))
 
+(defn gate-control-count [gate]
+  (let [controls (:controls gate)]
+    (if (and (integer? controls) (pos? controls))
+      controls
+      0)))
+
+(defn gate-port-count [gate]
+  (+ (gate-target-count gate) (gate-control-count gate)))
+
+(defn classical-register? [item]
+  (boolean (:classical item)))
+
 (defn port-count [item kind]
   (case (:type item)
-    :register (if (= :output kind) (or (:qubits item) 0) 0)
+    :register (if (classical-register? item)
+                (if (= :input kind) (or (:qubits item) 0) 0)
+                (if (= :output kind) (or (:qubits item) 0) 0))
     :gate (if (contains? #{:input :output} kind) (gate-port-count item) 0)
     0))
 
@@ -279,6 +365,36 @@
            (and (= gate-id (:to wire))
                 (= :input (get-in wire [:to-port :kind]))))
          (:wires state))))
+
+(defn output-register-targets [state item-id]
+  (->> (:wires state)
+       (keep (fn [wire]
+               (when (and (= item-id (:from wire))
+                          (= :output (get-in wire [:from-port :kind])))
+                 (let [to-item (item-by-id state (:to wire))]
+                   (when (and to-item
+                              (= :register (:type to-item))
+                              (classical-register? to-item)
+                              (= :input (get-in wire [:to-port :kind])))
+                     [(:to wire) (get-in wire [:to-port :index])])))))
+       vec))
+
+(defn output-target [state item-id index]
+  (first (filter (fn [wire]
+                   (and (= item-id (:from wire))
+                        (= :output (get-in wire [:from-port :kind]))
+                        (= index (get-in wire [:from-port :index]))))
+                 (:wires state))))
+
+(defn classical-targets [state gate-id]
+  (->> (output-register-targets state gate-id)
+       (sort-by (fn [[_ index]] index))
+       vec))
+
+(defn measure-targets [state gate-id]
+  (let [quantum (gate-targets state gate-id)
+        classical (classical-targets state gate-id)]
+    [(first quantum) (first classical)]))
 
 (defn delete-items [state item-ids]
   (let [item-ids (set item-ids)
@@ -456,14 +572,17 @@
 (defn close-context-menu [state]
   (assoc state :context-menu nil))
 
-(defn open-register-dialog [state x y]
-  (assoc state
-         :dialog {:name (next-register-name state)
-                  :qubits "2"
-                  :x x
-                  :y y
-                  :error nil}
-         :context-menu nil))
+(defn open-register-dialog
+  ([state x y] (open-register-dialog state x y false))
+  ([state x y classical]
+   (assoc state
+          :dialog (cond-> {:name (next-register-name state)
+                           :qubits "2"
+                           :x x
+                           :y y
+                           :error nil}
+                    classical (assoc :classical true))
+          :context-menu nil)))
 
 (defn open-custom-dialog [state x y]
   (assoc state
@@ -490,14 +609,74 @@
       state)
     state))
 
+(defn open-annotation-dialog [state x y]
+  (assoc state
+         :dialog {:type :annotation
+                  :x x
+                  :y y
+                  :text ""
+                  :error nil}
+         :context-menu nil))
+
+(defn open-annotation-editor [state item-id]
+  (if-let [item (item-by-id state item-id)]
+    (if (contains? #{:annotation :box} (:type item))
+      (assoc state
+             :dialog {:type :annotation
+                      :item-id item-id
+                      :target-type (:type item)
+                      :x (:x item)
+                      :y (:y item)
+                      :text (or (:text item) "")
+                      :error nil}
+             :context-menu nil)
+      state)
+    state))
+
+(defn open-metadata-dialog [state]
+  (assoc state
+         :dialog {:type :metadata
+                  :metadata (:metadata state)
+                  :error nil}
+         :context-menu nil))
+
+(defn open-export-dialog [state]
+  (assoc state
+         :dialog {:type :export
+                  :format "svg"
+                  :scale 1
+                  :transparent false
+                  :include-ui false
+                  :error nil}
+         :context-menu nil))
+
+(defn open-library-dialog [state]
+  (assoc state
+         :dialog {:type :library
+                  :name "My circuit"
+                  :error nil}
+         :context-menu nil))
+
+(defn open-diff-dialog [state diff]
+  (assoc state
+         :dialog {:type :diff
+                  :diff diff
+                  :error nil}
+         :context-menu nil))
+
 (defn open-gate-qubits-dialog [state gate-id]
   (if-let [gate (item-by-id state gate-id)]
     (if (= :gate (:type gate))
       (assoc state
-             :dialog {:type :gate-qubits
-                      :gate-id gate-id
-                      :qubits (str (gate-port-count gate))
-                      :error nil}
+             :dialog (cond-> {:type :gate-qubits
+                              :gate-id gate-id
+                              :qubits (str (gate-target-count gate))
+                              :error nil}
+                       (components/parameterized? (:component gate))
+                       (assoc :angle (or (:angle gate) default-angle))
+
+                       (pos? (gate-control-count gate))
+                       (assoc :controls (str (gate-control-count gate))))
              :context-menu nil)
       state)
     state))
@@ -505,44 +684,87 @@
 (defn- overflow-index? [index qubits]
   (and (integer? index) (>= index qubits)))
 
-(defn- wire-overflows? [gate-id qubits wire]
+(defn- wire-overflows? [gate-id ports wire]
   (or (and (= gate-id (:from wire))
-           (overflow-index? (get-in wire [:from-port :index]) qubits))
+           (overflow-index? (get-in wire [:from-port :index]) ports))
       (and (= gate-id (:to wire))
-           (overflow-index? (get-in wire [:to-port :index]) qubits))))
+           (overflow-index? (get-in wire [:to-port :index]) ports))))
 
-(defn- draft-overflows? [draft gate-id qubits]
+(defn- draft-overflows? [draft gate-id ports]
   (and (= gate-id (:from draft))
-       (overflow-index? (get-in draft [:from-port :index]) qubits)))
+       (overflow-index? (get-in draft [:from-port :index]) ports)))
+
+(defn- update-gate-shape [state gate-id f]
+  (let [gate (item-by-id state gate-id)
+        updated (f gate)
+        ports (gate-port-count updated)]
+    (-> state
+        (update :items
+                (fn [items]
+                  (mapv (fn [item]
+                          (if (= (:id item) gate-id)
+                            (dissoc updated :targets)
+                            item))
+                        items)))
+        (update :wires
+                (fn [wires]
+                  (filterv #(not (wire-overflows? gate-id ports %)) wires)))
+        (cond-> (and (:wire-draft state)
+                     (draft-overflows? (:wire-draft state) gate-id ports))
+          (assoc :wire-draft nil)))))
 
 (defn- update-gate-qubits [state gate-id qubits]
-  (-> state
-      (update :items
-              (fn [items]
-                (mapv (fn [item]
-                        (if (= (:id item) gate-id)
-                          (-> item
-                              (assoc :qubits qubits)
-                              (dissoc :targets))
-                          item))
-                      items)))
-      (update :wires
-              (fn [wires]
-                (filterv #(not (wire-overflows? gate-id qubits %)) wires)))
-      (cond-> (and (:wire-draft state)
-                   (draft-overflows? (:wire-draft state) gate-id qubits))
-        (assoc :wire-draft nil))))
+  (update-gate-shape state gate-id #(assoc % :qubits qubits)))
 
-(defn confirm-gate-qubits [state qubits]
-  (if-let [dialog (:dialog state)]
-    (if (= :gate-qubits (:type dialog))
-      (if-let [n (parse-qubits qubits)]
-        (-> (update-gate-qubits state (:gate-id dialog) n)
-            (assoc :dialog nil))
-        (assoc-in state [:dialog :error]
-                  "Number of qubits must be a positive whole number."))
+(defn set-gate-controls [state gate-id controls]
+  (let [controls (if (and (integer? controls) (pos? controls)) controls 0)]
+    (update-gate-shape state gate-id #(cond-> %
+                                        (pos? controls) (assoc :controls controls)
+                                        (zero? controls) (dissoc :controls)))))
+
+(defn toggle-gate-control [state gate-id]
+  (if-let [gate (item-by-id state gate-id)]
+    (if (= :gate (:type gate))
+      (set-gate-controls state gate-id (if (pos? (gate-control-count gate)) 0 1))
       state)
     state))
+
+(defn- parse-controls [value]
+  (let [text (some-> value str str/trim)]
+    (if (re-matches #"[0-9]+" (or text ""))
+      (js/parseInt text 10)
+      0)))
+
+(defn- apply-gate-angle [item angle]
+  (let [text (some-> angle str str/trim)]
+    (if (and (components/parameterized? (:component item))
+             (not (str/blank? text)))
+      (assoc item :angle text)
+      (dissoc item :angle))))
+
+(defn confirm-gate-qubits
+  ([state qubits] (confirm-gate-qubits state qubits nil nil))
+  ([state qubits angle] (confirm-gate-qubits state qubits angle nil))
+  ([state qubits angle controls]
+   (if-let [dialog (:dialog state)]
+     (if (= :gate-qubits (:type dialog))
+       (if-let [n (parse-qubits qubits)]
+         (let [gate-id (:gate-id dialog)
+               with-shape (-> (update-gate-qubits state gate-id n)
+                              (cond-> (some? controls)
+                                (set-gate-controls gate-id (parse-controls controls))))]
+           (-> with-shape
+               (update :items
+                       (fn [items]
+                         (mapv #(if (= gate-id (:id %))
+                                  (apply-gate-angle % angle)
+                                  %)
+                               items)))
+               (assoc :dialog nil)))
+         (assoc-in state [:dialog :error]
+                   "Number of qubits must be a positive whole number."))
+       state)
+     state)))
 
 (defn confirm-custom-gate [state qubits qasm]
   (if-let [dialog (:dialog state)]
@@ -575,13 +797,32 @@
       state)
     state))
 
+(defn- add-gate-with-defaults [state component x y]
+  (let [qubits (components/default-qubits (:id component))
+        state (add-gate state component x y)]
+    (if (> qubits 1)
+      (update-in state [:items (dec (count (:items state))) :qubits] (constantly qubits))
+      state)))
+
+(defn- add-box [state x y]
+  (add-item state {:id (:next-id state)
+                   :type :box
+                   :component :box
+                   :text "Group"
+                   :width (first box-size)
+                   :height (second box-size)
+                   :x x
+                   :y y}))
+
 (defn handle-drop [state component-id x y]
   (if-let [component (components/by-id component-id)]
     (let [[x y] (snap-point state [x y])]
       (case (:kind component)
-        :register (open-register-dialog state x y)
+        :register (open-register-dialog state x y (:classical component))
         :custom (open-custom-dialog state x y)
-        :gate (add-gate state component x y)
+        :annotation (open-annotation-dialog state x y)
+        :box (add-box state x y)
+        :gate (add-gate-with-defaults state component x y)
         state))
     state))
 
@@ -592,16 +833,62 @@
                                   :name (str name)
                                   :qubits (str qubits)
                                   :error errors))
-      (let [item {:id (:next-id state)
-                  :type :register
-                  :component :quantum-register
-                  :name (str/trim (str name))
-                  :qubits (parse-qubits qubits)
-                  :x (:x dialog)
-                  :y (:y dialog)}]
+      (let [classical? (:classical dialog)
+            item (cond-> {:id (:next-id state)
+                          :type :register
+                          :component (if classical?
+                                       :classical-register
+                                       :quantum-register)
+                          :name (str/trim (str name))
+                          :qubits (parse-qubits qubits)
+                          :x (:x dialog)
+                          :y (:y dialog)}
+                   classical? (assoc :classical true))]
         (-> state
             (add-item item)
             (assoc :dialog nil))))
+    state))
+
+(defn confirm-annotation [state text]
+  (if-let [dialog (:dialog state)]
+    (if (= :annotation (:type dialog))
+      (let [text (str/trim (str text))]
+        (if (str/blank? text)
+          (assoc-in state [:dialog :error] "Text is required.")
+          (if-let [item-id (:item-id dialog)]
+            (-> state
+                (update :items
+                        (fn [items]
+                          (mapv #(if (= item-id (:id %))
+                                   (assoc % :text text)
+                                   %)
+                                items)))
+                (assoc :dialog nil))
+            (let [width (max 60 (+ 24 (* 8 (count text))))]
+              (-> state
+                  (add-item {:id (:next-id state)
+                             :type :annotation
+                             :component :annotation
+                             :text text
+                             :width width
+                             :height 30
+                             :x (:x dialog)
+                             :y (:y dialog)})
+                  (assoc :dialog nil))))))
+      state)
+    state))
+
+(defn confirm-metadata [state metadata]
+  (if-let [dialog (:dialog state)]
+    (if (= :metadata (:type dialog))
+      (let [clean (into {}
+                        (map (fn [[key value]]
+                               [key (str/trim (str value))]))
+                        (select-keys metadata [:name :author :description]))]
+        (-> state
+            (assoc :metadata clean)
+            (assoc :dialog nil)))
+      state)
     state))
 
 (defn cancel-dialog [state]
@@ -611,3 +898,168 @@
 
 (defn cancel-register [state]
   (cancel-dialog state))
+
+(defn snapshot [state]
+  (select-keys state [:items :wires :next-id :next-wire-id
+                      :metadata :includes :raw-statements]))
+
+(defn set-baseline [state]
+  (assoc state :baseline (snapshot state)))
+
+(defn append-history [before after]
+  (let [history (:history before [])
+        index (:history-index before -1)
+        base (if (empty? history)
+               [(snapshot before)]
+               (subvec history 0 (inc index)))
+        history (conj base (snapshot after))
+        history (if (> (count history) history-limit)
+                  (subvec history (- (count history) history-limit))
+                  history)]
+    (assoc after
+           :history history
+           :history-index (dec (count history)))))
+
+(defn can-undo? [state]
+  (pos? (or (:history-index state) 0)))
+
+(defn can-redo? [state]
+  (let [history (:history state [])
+        index (:history-index state -1)]
+    (< index (dec (count history)))))
+
+(defn- restore-snapshot [state snapshot index]
+  (merge state
+         snapshot
+         {:history (:history state)
+          :history-index index
+          :selected #{}
+          :context-menu nil
+          :dialog nil
+          :wire-draft nil
+          :marquee nil}))
+
+(defn undo [state]
+  (let [index (:history-index state -1)
+        history (:history state [])]
+    (if (pos? index)
+      (restore-snapshot state (nth history (dec index)) (dec index))
+      state)))
+
+(defn redo [state]
+  (let [index (:history-index state -1)
+        history (:history state [])
+        next-index (inc index)]
+    (if (and (not (neg? next-index))
+             (< next-index (count history)))
+      (restore-snapshot state (nth history next-index) next-index)
+      state)))
+
+(defn selection-snapshot [state]
+  (let [selected (set (:selected state))
+        items (vec (filter #(contains? selected (:id %)) (:items state)))]
+    (when (seq items)
+      (let [min-x (apply min (map :x items))
+            min-y (apply min (map :y items))
+            ids (set (map :id items))
+            items (mapv #(update % :x - min-x) items)
+            items (mapv #(update % :y - min-y) items)
+            wires (vec (filter (fn [wire]
+                                 (and (contains? ids (:from wire))
+                                      (contains? ids (:to wire))))
+                               (:wires state)))]
+        {:items items
+         :wires wires
+         :origin [min-x min-y]}))))
+
+(defn- remap-item [item ids next-id]
+  (let [new-id (get ids (:id item))]
+    (assoc item :id new-id)))
+
+(defn paste-snapshot [state snapshot dx dy]
+  (if-let [items (:items snapshot)]
+    (if (seq items)
+      (let [next-id (:next-id state)
+            ids (into {} (map-indexed (fn [index item]
+                                        [(:id item) (+ next-id index)])
+                                      items))
+            items (mapv (fn [item]
+                          (-> item
+                              (remap-item ids next-id)
+                              (update :x + dx)
+                              (update :y + dy)))
+                        items)
+            next-wire-id (:next-wire-id state)
+            wires (vec (map-indexed (fn [index wire]
+                                      (assoc wire
+                                             :id (+ next-wire-id index)
+                                             :from (get ids (:from wire))
+                                             :to (get ids (:to wire))))
+                                    (:wires snapshot)))
+            new-ids (set (vals ids))]
+        (-> state
+            (update :items into items)
+            (update :wires into wires)
+            (assoc :next-id (+ next-id (count items))
+                   :next-wire-id (+ next-wire-id (count wires))
+                   :selected new-ids
+                   :context-menu nil
+                   :clipboard snapshot)))
+      state)
+    state))
+
+(defn copy-selection [state]
+  (if-let [snapshot (selection-snapshot state)]
+    (assoc state :clipboard snapshot)
+    state))
+
+(defn paste-clipboard [state dx dy]
+  (if-let [snapshot (:clipboard state)]
+    (paste-snapshot state snapshot dx dy)
+    state))
+
+(defn duplicate-selection [state]
+  (if-let [snapshot (selection-snapshot state)]
+    (paste-snapshot state snapshot 20 20)
+    state))
+
+(defn set-clipboard [state snapshot]
+  (if snapshot
+    (assoc state :clipboard snapshot)
+    state))
+
+(defn set-snap-size [state size]
+  (if (and (number? size) (pos? size))
+    (assoc state :snap-size size)
+    state))
+
+(defn set-theme [state theme]
+  (assoc state :theme (if (= :dark theme) :dark :light)))
+
+(defn toggle-theme [state]
+  (set-theme state (if (= :dark (:theme state)) :light :dark)))
+
+(defn set-component-search [state text]
+  (assoc state :component-search (str (or text ""))))
+
+(defn fit-view
+  ([state] (fit-view state 800 600))
+  ([state width height]
+   (let [items (:items state)]
+     (if (empty? items)
+       (reset-view state)
+       (let [bounds (map item-bounds items)
+             x1 (apply min (map first bounds))
+             y1 (apply min (map second bounds))
+             x2 (apply max (map #(nth % 2) bounds))
+             y2 (apply max (map #(nth % 3) bounds))
+             margin 40
+             content-width (max 1 (- x2 x1))
+             content-height (max 1 (- y2 y1))
+             zoom (clamp (min (/ (- width (* 2 margin)) content-width)
+                              (/ (- height (* 2 margin)) content-height))
+                         min-zoom
+                         max-zoom)
+             pan-x (- (/ width 2) (* zoom (/ (+ x1 x2) 2)))
+             pan-y (- (/ height 2) (* zoom (/ (+ y1 y2) 2)))]
+         (assoc state :view {:pan-x pan-x :pan-y pan-y :zoom zoom}))))))

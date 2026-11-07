@@ -10,6 +10,21 @@
 (set! (.-window js/globalThis) (.-window dom))
 (set! (.-document js/globalThis) (.-document (.-window dom)))
 
+(defonce ^:private storage-data (atom {}))
+
+(defn- fake-storage []
+  #js {:getItem (fn [key] (get @storage-data key))
+       :setItem (fn [key value] (swap! storage-data assoc key (str value)))
+       :removeItem (fn [key] (swap! storage-data dissoc key))
+       :clear (fn [] (reset! storage-data {}))})
+
+(set! (.-localStorage js/globalThis) (fake-storage))
+
+(defn- clear-storage! []
+  (reset! storage-data {})
+  (when-let [storage (.-localStorage js/globalThis)]
+    (when (.-clear storage) (.clear storage))))
+
 (defn- document []
   (.-document js/globalThis))
 
@@ -28,12 +43,14 @@
 
 (defn- reset-app! []
   (stop-app!)
+  (clear-storage!)
   (set! (.-innerHTML (.-body (document))) "<div id=\"app\"></div>")
   (set! (.-electronAPI js/window) nil)
   (reset! session (core/init!)))
 
 (defn- reset-app-with-api! [api]
   (stop-app!)
+  (clear-storage!)
   (set! (.-innerHTML (.-body (document))) "<div id=\"app\"></div>")
   (set! (.-electronAPI js/window) api)
   (reset! session (core/init!)))
@@ -73,6 +90,15 @@
 (defn- drop-component! [component-id x y]
   (drop-at! (dragstart-component! component-id) x y))
 
+(defn- dragstart-block! [attribute value]
+  (let [node (select (str "[" attribute "=\"" value "\"]"))
+        event (js/window.Event. "dragstart" #js {:bubbles true :cancelable true})
+        data-transfer (fake-data-transfer)]
+    (is (some? node))
+    (set! (.-dataTransfer event) data-transfer)
+    (.dispatchEvent node event)
+    data-transfer))
+
 (defn- submit-register! [name qubits]
   (set! (.-value (select "#register-name")) name)
   (set! (.-value (select "#register-qubits")) qubits)
@@ -88,8 +114,11 @@
 (defn- mouse-down! [target options]
   (.dispatchEvent target (mouse-event "mousedown" (merge {:button 0} options))))
 
+(defn- mouse-move-on! [target options]
+  (.dispatchEvent target (mouse-event "mousemove" options)))
+
 (defn- mouse-move! [options]
-  (.dispatchEvent (document) (mouse-event "mousemove" options)))
+  (mouse-move-on! (document) options))
 
 (defn- mouse-up! []
   (.dispatchEvent (document) (mouse-event "mouseup" {})))
@@ -119,18 +148,21 @@
       (is (some? panel))
       (is (some? canvas))
       (is (= "20%" (.. panel -style -width)))
-      (is (= "1" (.. canvas -style -flexGrow))))))
+      (is (= "1" (.. canvas -style -flexGrow)))
+      (is (some? (.closest (select "#wire-tool") ".app-toolbar")))
+      (is (nil? (.closest (select "#wire-tool") "#canvas-panel"))))))
 
 (deftest components-panel-test
   (testing "all required components are rendered as draggable rectangles"
     (let [tiles (select-all ".component-tile")]
-      (is (= 15 (count tiles)))
-      (is (= ["quantum-register" "h" "x" "y" "z" "s" "t" "sdag" "tdag" "rx" "ry" "rz" "p" "i"
-              "custom"]
+      (is (= 25 (count tiles)))
+      (is (= ["quantum-register" "classical-register" "h" "x" "y" "z" "s" "t"
+              "sdag" "tdag" "rx" "ry" "rz" "p" "i" "cx" "cz" "swap" "ccx"
+              "measure" "reset" "barrier" "custom" "annotation" "box"]
              (mapv #(.getAttribute % "data-component-id") tiles)))
       (is (every? #(= "true" (.getAttribute % "draggable")) tiles))
       (is (= "Quantum register" (.-textContent (first tiles))))
-      (is (= "H" (.-textContent (second tiles)))))))
+      (is (= "H" (.-textContent (nth tiles 2)))))))
 
 (deftest dragover-test
   (testing "dragging over the canvas is allowed"
@@ -1000,3 +1032,402 @@
     (submit-gate-qubits! "1")
     (is (= 1 (count (item-ports 2 "input"))))
     (is (= 1 (count (select-all ".canvas-wire:not(.canvas-wire-draft)"))))))
+
+(defn- change! [target]
+  (.dispatchEvent target (js/window.Event. "change" #js {:bubbles true})))
+
+(defn- input! [target value]
+  (set! (.-value target) value)
+  (.dispatchEvent target (js/window.Event. "input" #js {:bubbles true})))
+
+(defn- json-save-api [calls callbacks]
+  #js {:ping (fn [] (js/Promise.resolve "pong"))
+       :saveFile (fn [content suggested-name filters]
+                   (swap! calls conj [content suggested-name filters])
+                   (thenable #js {:canceled false :filePath suggested-name}))
+       :onMenuSave (fn [callback]
+                     (swap! callbacks conj callback)
+                     (fn [] nil))})
+
+(defn- export-api [calls]
+  #js {:ping (fn [] (js/Promise.resolve "pong"))
+       :saveFile (fn [content suggested-name filters]
+                   (swap! calls conj {:content content
+                                      :name suggested-name
+                                      :filters filters})
+                   (thenable #js {:canceled false}))
+       :saveBinary (fn [base64 suggested-name filters]
+                     (swap! calls conj {:base64 base64
+                                        :name suggested-name
+                                        :filters filters})
+                     (thenable #js {:canceled false}))})
+
+(deftest undo-redo-buttons-test
+  (testing "undo and redo work from the canvas toolbar"
+    (drop-component! :h 100 100)
+    (is (= 1 (count (select-all ".canvas-gate"))))
+    (.click (select "#undo-button"))
+    (is (= 0 (count (select-all ".canvas-gate"))))
+    (is (not (.-disabled (select "#redo-button"))))
+    (.click (select "#redo-button"))
+    (is (= 1 (count (select-all ".canvas-gate"))))
+    (key-down! "z" {:ctrlKey true})
+    (is (= 0 (count (select-all ".canvas-gate"))))
+    (key-down! "z" {:ctrlKey true :shiftKey true})
+    (is (= 1 (count (select-all ".canvas-gate"))))))
+
+(deftest copy-paste-test
+  (testing "copy and paste duplicate the selection with an offset"
+    (drop-component! :h 100 100)
+    (mouse-down! (select "[data-item-id=\"1\"]") {:clientX 100 :clientY 100})
+    (mouse-up!)
+    (key-down! "c" {:ctrlKey true})
+    (key-down! "v" {:ctrlKey true})
+    (let [gates (select-all ".canvas-gate")]
+      (is (= 2 (count gates)))
+      (is (= ["100px" "20px"] (mapv #(.. % -style -left) gates)))
+      (is (= ["100px" "20px"] (mapv #(.. % -style -top) gates)))
+      (is (= 1 (count (select-all ".canvas-gate.selected")))))))
+
+(defn- submit-gate-details! [qubits angle controls]
+  (when-let [input (select "#gate-qubits")]
+    (set! (.-value input) qubits))
+  (when-let [input (select "#gate-angle")]
+    (set! (.-value input) angle))
+  (when-let [input (select "#gate-controls")]
+    (set! (.-value input) controls))
+  (.dispatchEvent (select "#gate-qubits-form")
+                  (js/window.Event. "submit" #js {:bubbles true :cancelable true})))
+
+(deftest gate-angle-save-test
+  (testing "the angle entered in the gate dialog is exported"
+    (let [calls (atom [])
+          callbacks (atom [])]
+      (reset-app-with-api! (save-api calls callbacks (atom 0)))
+      (drop-component! :quantum-register 40 40)
+      (submit-register! "data" "1")
+      (drop-component! :rx 240 40)
+      (double-click! (select "[data-item-id=\"2\"]"))
+      (is (some? (select "#gate-angle")))
+      (submit-gate-details! "1" "pi/4" "0")
+      (wire-between-ports! 1 0 2 0)
+      ((first @callbacks))
+      (let [[content] (first @calls)]
+        (is (str/includes? content "rx(pi/4) data[0];"))))))
+
+(deftest gate-control-save-test
+  (testing "controls entered in the gate dialog export a controlled gate"
+    (let [calls (atom [])
+          callbacks (atom [])]
+      (reset-app-with-api! (save-api calls callbacks (atom 0)))
+      (drop-component! :quantum-register 40 40)
+      (submit-register! "data" "2")
+      (drop-component! :h 240 40)
+      (double-click! (select "[data-item-id=\"2\"]"))
+      (submit-gate-details! "2" "" "1")
+      (wire-between-ports! 1 0 2 0)
+      (wire-between-ports! 1 1 2 1)
+      ((first @callbacks))
+      (let [[content] (first @calls)]
+        (is (str/includes? content "ctrl @ h data[0], data[1];"))))))
+
+(deftest barrier-rendering-test
+  (testing "the barrier component gets its own canvas style"
+    (drop-component! :barrier 100 100)
+    (let [gate (select ".canvas-gate")]
+      (is (some? gate))
+      (is (.contains (.-classList gate) "canvas-barrier"))
+      (is (= "Barrier" (.-textContent gate))))))
+
+(deftest measure-and-classical-register-test
+  (testing "a measurement can be wired to a classical register and saved"
+    (let [calls (atom [])
+          callbacks (atom [])]
+      (reset-app-with-api! (save-api calls callbacks (atom 0)))
+      (drop-component! :quantum-register 40 40)
+      (submit-register! "q" "2")
+      (drop-component! :classical-register 40 220)
+      (submit-register! "c" "2")
+      (let [classical (select ".canvas-classical-register")]
+        (is (some? classical))
+        (is (= "c (2 bits)" (.-textContent classical)))
+        (is (= 2 (count (item-ports 2 "input")))))
+      (drop-component! :measure 240 40)
+      (let [measure (select "[data-item-id=\"3\"]")]
+        (is (.contains (.-classList measure) "canvas-measure")))
+      (wire-between-ports! 1 0 3 0)
+      (wire-between-ports! 3 0 2 1)
+      (toggle-wire-tool!)
+      ((first @callbacks))
+      (let [[content] (first @calls)]
+        (is (str/includes? content "bit[2] c;"))
+        (is (str/includes? content "measure q[0] -> c[1];"))))))
+
+(deftest metadata-dialog-test
+  (testing "circuit metadata is edited and shown in the properties panel"
+    (.click (select "#properties-button"))
+    (is (some? (select "#metadata-form")))
+    (set! (.-value (select "#metadata-name")) "Bell")
+    (set! (.-value (select "#metadata-author")) "Ada")
+    (set! (.-value (select "#metadata-description")) "Two qubit demo")
+    (.click (select "#metadata-confirm"))
+    (is (nil? (select "#metadata-form")))
+    (is (str/includes? (.-textContent (select "#property-panel")) "Bell"))
+    (is (str/includes? (.-textContent (select "#property-panel")) "Ada"))
+    (is (str/includes? (.-textContent (select "#property-panel"))
+                       "Two qubit demo"))
+    (.click (select "#properties-button"))
+    (is (= "Bell" (.-value (select "#metadata-name"))))
+    (is (= "Ada" (.-value (select "#metadata-author"))))
+    (is (= "Two qubit demo" (.-value (select "#metadata-description"))))))
+
+(deftest diff-dialog-test
+  (testing "the diff dialog compares the circuit with the last save"
+    (let [calls (atom [])
+          callbacks (atom [])]
+      (reset-app-with-api! (json-save-api calls callbacks))
+      (drop-component! :h 100 100)
+      ((first @callbacks))
+      (is (= 1 (count @calls)))
+      (.click (select "#diff-button"))
+      (is (some? (select "#diff-form")))
+      (is (= "No differences." (.-textContent (select "#diff-content"))))
+      (.click (select "#diff-close"))
+      (is (nil? (select "#diff-form")))
+      (double-click! (select "[data-item-id=\"1\"]"))
+      (submit-gate-qubits! "2")
+      (.click (select "#diff-button"))
+      (is (str/includes? (.-textContent (select "#diff-content")) "~ gate 1 h"))
+      (.click (select "#diff-close")))))
+
+(deftest export-dialog-test
+  (testing "SVG export options are applied and the file is saved"
+    (let [calls (atom [])]
+      (reset-app-with-api! (export-api calls))
+      (drop-component! :h 100 100)
+      (.click (select "#export-button"))
+      (is (some? (select "#export-form")))
+      (is (= ["svg" "png"] (mapv #(.-value %) (select-all "#export-format option"))))
+      (is (= ["1" "2" "3"] (mapv #(.-value %) (select-all "#export-scale option"))))
+      (is (str/includes? (.-textContent (select ".checkbox-label"))
+                         "Transparent background"))
+      (is (not (.-checked (select "#export-transparent"))))
+      (set! (.-checked (select "#export-transparent")) true)
+      (change! (select "#export-transparent"))
+      (is (some? (select "#export-transparent")))
+      (change! (select "#export-scale"))
+      (.click (select "#export-confirm"))
+      (is (nil? (select "#export-form")))
+      (let [{:keys [content name]} (first @calls)]
+        (is (= "circuit.svg" name))
+        (is (str/includes? content "<svg"))
+        (is (str/includes? content "H"))
+        (is (not (str/includes? content "<rect x=\"-24\" y=\"-24\" width=")))))))
+
+(deftest library-dialog-test
+  (testing "templates and saved circuits are available in the library"
+    (drop-component! :h 100 100)
+    (.click (select "#library-button"))
+    (is (some? (select "#library-form")))
+    (is (= ["bell" "ghz" "qft" "grover" "teleportation"]
+           (mapv #(.getAttribute % "data-template-id")
+                 (select-all "[data-template-id]"))))
+    (.click (select "[data-template-id=\"bell\"]"))
+    (is (nil? (select "#library-form")))
+    (is (= 4 (count (select-all ".canvas-item"))))
+    (is (= 3 (count (select-all ".canvas-wire"))))
+    (.click (select "#library-button"))
+    (input! (select "#library-name") "My circuit")
+    (.click (select "#library-save"))
+    (is (some? (select "[data-library-name=\"My circuit\"]")))
+    (.click (select "[data-library-delete=\"My circuit\"]"))
+    (is (nil? (select "[data-library-name=\"My circuit\"]")))
+    (.click (select "#library-cancel"))
+    (is (nil? (select "#library-form")))))
+
+(deftest search-and-grid-test
+  (testing "the component search filters the palette"
+    (input! (select "#component-search") "swap")
+    (is (= ["swap"] (mapv #(.getAttribute % "data-component-id")
+                          (select-all ".component-tile"))))
+    (is (= "swap" (.-value (select "#component-search"))))
+    (input! (select "#component-search") "")
+    (is (= 25 (count (select-all ".component-tile")))))
+
+  (testing "changing the grid size snaps subsequent drops"
+    (let [select-node (select "#grid-size-select")]
+      (set! (.-value select-node) "40")
+      (change! select-node))
+    (is (= "40" (.-value (select "#grid-size-select"))))
+    (drop-component! :h 105 107)
+    (let [gate (select ".canvas-gate")]
+      (is (= "120px" (.. gate -style -left)))
+      (is (= "120px" (.. gate -style -top))))))
+
+(deftest theme-toggle-test
+  (testing "the theme toggle switches between light and dark"
+    (is (not (str/includes? (.-className (select ".app")) "theme-dark")))
+    (.click (select "#theme-toggle"))
+    (is (str/includes? (.-className (select ".app")) "theme-dark"))
+    (.click (select "#theme-toggle"))
+    (is (not (str/includes? (.-className (select ".app")) "theme-dark")))))
+
+(deftest electron-clipboard-test
+  (testing "copy and paste use the Electron clipboard when available"
+    (let [clipboard (atom "")
+          calls (atom [])
+          api #js {:ping (fn [] (js/Promise.resolve "pong"))
+                   :writeClipboard (fn [text]
+                                     (reset! clipboard text)
+                                     (swap! calls conj :write)
+                                     (thenable nil))
+                   :readClipboard (fn []
+                                    (swap! calls conj :read)
+                                    (thenable @clipboard))}]
+      (reset-app-with-api! api)
+      (drop-component! :h 100 100)
+      (mouse-down! (select "[data-item-id=\"1\"]") {:clientX 100 :clientY 100})
+      (mouse-up!)
+      (key-down! "c" {:ctrlKey true})
+      (is (str/includes? @clipboard "\"items\""))
+      (key-down! "v" {:ctrlKey true})
+      (is (= 2 (count (select-all ".canvas-gate"))))
+      (is (= [:write :read] @calls)))))
+
+(defn- menu-api [callbacks calls]
+  #js {:ping (fn [] (js/Promise.resolve "pong"))
+       :onMenuSave (fn [callback]
+                     (swap! callbacks assoc :save callback)
+                     (fn [] (swap! calls conj :save-unsub)))
+       :onMenuExport (fn [callback]
+                       (swap! callbacks assoc :export callback)
+                       (fn [] (swap! calls conj :export-unsub)))
+       :onMenuLibrary (fn [callback]
+                        (swap! callbacks assoc :library callback)
+                        (fn [] (swap! calls conj :library-unsub)))
+       :onMenuOpenRecent (fn [callback]
+                           (swap! callbacks assoc :recent callback)
+                           (fn [] (swap! calls conj :recent-unsub)))
+       :openFileAt (fn [path]
+                     (swap! calls conj path)
+                     (thenable #js {:canceled false
+                                    :filePath path
+                                    :content (str "OPENQASM 3.0;\n"
+                                                  "qubit[1] q;\n"
+                                                  "h q[0];\n")}))})
+
+(deftest application-menu-test
+  (testing "menu actions open dialogs and recent files"
+    (let [callbacks (atom {})
+          calls (atom [])]
+      (reset-app-with-api! (menu-api callbacks calls))
+      ((:export @callbacks))
+      (is (some? (select "#export-form")))
+      (.click (select "#export-cancel"))
+      (is (nil? (select "#export-form")))
+      ((:library @callbacks))
+      (is (some? (select "#library-form")))
+      (.click (select "#library-cancel"))
+      (is (nil? (select "#library-form")))
+      ((:recent @callbacks) "recent.qasm")
+      (is (= "recent.qasm" (first @calls)))
+      (is (= "q (1 qubit)" (.-textContent (select ".canvas-register"))))
+      (is (= "H" (.-textContent (select ".canvas-gate"))))
+      (stop-app!)
+      (is (some #{:save-unsub :export-unsub :library-unsub :recent-unsub} @calls)))))
+
+(deftest component-snap-toolbar-test
+  (testing "the alignment toggle updates the toolbar and responds to A"
+    (let [button (select "#component-snap-toggle")]
+      (is (some? button))
+      (is (not (str/includes? (.-className button) "active")))
+      (.click button)
+      (is (str/includes? (.-className (select "#component-snap-toggle")) "active"))
+      (key-down! "a")
+      (is (not (str/includes? (.-className (select "#component-snap-toggle"))
+                              "active"))))))
+
+(deftest control-line-render-test
+  (testing "gates with controls render a control line"
+    (drop-component! :h 100 100)
+    (double-click! (select "[data-item-id=\"1\"]"))
+    (set! (.-value (select "#gate-controls")) "1")
+    (submit-gate-qubits! "1")
+    (is (= 1 (count (select-all ".canvas-control-line"))))
+    (is (= 1 (count (select-all ".item-port-control"))))))
+
+(deftest export-include-ui-test
+  (testing "the include grid option adds a grid pattern to the export"
+    (let [calls (atom [])]
+      (reset-app-with-api! (export-api calls))
+      (drop-component! :h 100 100)
+      (.click (select "#export-button"))
+      (is (some? (select "#export-include-ui")))
+      (is (not (.-checked (select "#export-include-ui"))))
+      (set! (.-checked (select "#export-include-ui")) true)
+      (change! (select "#export-include-ui"))
+      (.click (select "#export-confirm"))
+      (let [{:keys [content]} (first @calls)]
+        (is (str/includes? content "qcad-grid"))
+        (is (str/includes? content "export-grid"))))))
+
+(deftest block-drag-test
+  (testing "a template is dragged from the library as a labelled block"
+    (drop-component! :h 100 100)
+    (.click (select "#library-button"))
+    (let [data-transfer (dragstart-block! "data-block-template" "bell")]
+      (is (= "template:bell" (.getData data-transfer "application/x-qcad-block")))
+      (drop-at! data-transfer 300 200))
+    (is (nil? (select "#library-form")))
+    (is (= 1 (count (select-all ".canvas-box"))))
+    (let [box (select ".canvas-box")]
+      (is (= "Bell state" (.-textContent box)))
+      (is (= "300px" (.. box -style -left)))
+      (is (= "200px" (.. box -style -top))))))
+
+(deftest block-library-drag-test
+  (testing "a saved circuit is dragged from the library as a block"
+    (drop-component! :h 100 100)
+    (.click (select "#library-button"))
+    (input! (select "#library-name") "demo block")
+    (.click (select "#library-save"))
+    (let [data-transfer (dragstart-block! "data-block-library" "demo block")]
+      (is (= "library:demo block"
+             (.getData data-transfer "application/x-qcad-block")))
+      (drop-at! data-transfer 200 200))
+    (is (nil? (select "#library-form")))
+    (let [box (select ".canvas-box")]
+      (is (some? box))
+      (is (= "demo block" (.-textContent box)))
+      (is (= 3 (count (select-all ".canvas-item")))))))
+
+(deftest components-panel-scroll-test
+  (testing "moving the pointer over the palette keeps its scroll position"
+    (let [panel (select "#components-panel")]
+      (set! (.-scrollTop panel) 240)
+      (mouse-move-on! (select "[data-component-id=\"h\"]")
+                      {:clientX 20 :clientY 200})
+      (is (= 240 (.-scrollTop (select "#components-panel"))))))
+
+  (testing "re-rendering the app preserves the palette scroll position"
+    (let [panel (select "#components-panel")]
+      (set! (.-scrollTop panel) 180)
+      (set! (.-value (select "#grid-size-select")) "40")
+      (change! (select "#grid-size-select"))
+      (is (= 180 (.-scrollTop (select "#components-panel")))))))
+
+(deftest toolbar-select-interaction-test
+  (testing "moving the pointer over the grid select does not rebuild it"
+    (let [select-node (select "#grid-size-select")]
+      (.focus select-node)
+      (set! (.-value select-node) "20")
+      (mouse-move-on! select-node {:clientX 100 :clientY 10})
+      (is (identical? select-node (select "#grid-size-select")))
+      (is (identical? select-node (.-activeElement (document))))
+      (set! (.-value (select "#grid-size-select")) "40")
+      (change! (select "#grid-size-select"))
+      (is (= "40" (.-value (select "#grid-size-select"))))
+      (set! (.-value (select "#grid-size-select")) "20")
+      (change! (select "#grid-size-select"))
+      (is (= "20" (.-value (select "#grid-size-select"))))
+      (is (= "Grid 20" (status-text "#grid-size"))))))

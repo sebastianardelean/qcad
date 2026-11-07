@@ -1,61 +1,292 @@
 (ns app.core
-  (:require [app.dom :as dom]
+  (:require [clojure.string :as str]
+            [app.dom :as dom]
+            [app.export :as export]
+            [app.library :as library]
             [app.model :as model]
+            [app.persist :as persist]
             [app.qasm :as qasm]))
 
+(def ^:private autosave-timer (atom nil))
+
+(defn- commit! [state f & args]
+  (swap! state
+         (fn [before]
+           (let [after (apply f before args)]
+             (if (= (model/snapshot before) (model/snapshot after))
+               after
+               (model/append-history before after))))))
+
+(defn- autosave-enabled? []
+  (boolean (.-electronAPI js/window)))
+
+(defn- schedule-autosave! [state]
+  (when (autosave-enabled?)
+    (when @autosave-timer
+      (js/clearTimeout @autosave-timer))
+    (reset! autosave-timer
+            (js/setTimeout #(persist/save-autosave! state) 400))))
+
+(def ^:private scroll-region-selectors
+  ["#components-panel" "#property-panel" "#library-template-list"
+   "#library-user-list" "#diff-content"])
+
+(defn- scroll-offsets [root]
+  (into {}
+        (keep (fn [selector]
+                (when-let [node (.querySelector root selector)]
+                  (when (pos? (.-scrollTop node))
+                    [selector (.-scrollTop node)]))))
+        scroll-region-selectors))
+
+(defn- restore-scroll! [root offsets]
+  (doseq [[selector offset] offsets]
+    (when-let [node (.querySelector root selector)]
+      (set! (.-scrollTop node) offset))))
+
 (defn- render! [root state]
-  (set! (.-innerHTML root) "")
-  (.appendChild root (dom/render-app state))
-  (dom/refresh-wires! root state))
+  (let [offsets (scroll-offsets root)]
+    (set! (.-innerHTML root) "")
+    (.appendChild root (dom/render-app state))
+    (dom/refresh-wires! root state)
+    (restore-scroll! root offsets))
+  (schedule-autosave! state))
+
+(defn- download-url! [url name]
+  (let [link (.createElement js/document "a")]
+    (set! (.-href link) url)
+    (set! (.-download link) name)
+    (.appendChild (.-body js/document) link)
+    (.click link)
+    (.remove link)))
+
+(defn- download-text! [text name mime]
+  (download-url! (str "data:" mime ";charset=utf-8," (js/encodeURIComponent text))
+                 name))
+
+(defn- save-text!
+  ([text default-name filters] (save-text! text default-name filters nil))
+  ([text default-name filters on-saved]
+   (let [api (.-electronAPI js/window)]
+     (if-let [save (and api (.-saveFile api))]
+       (-> (.saveFile api text default-name filters)
+           (.then (fn [^js result]
+                    (when (and on-saved
+                               (not (and result (.-canceled result))))
+                      (on-saved))))
+           (.catch (fn [error]
+                     (js/console.error "Could not save file." error))))
+       (do
+         (download-text! text default-name "text/plain")
+         (when on-saved (on-saved)))))))
+
+(defn- save-binary! [base64 default-name filters]
+  (let [api (.-electronAPI js/window)]
+    (if-let [save (and api (.-saveBinary api))]
+      (-> (.saveBinary api base64 default-name filters)
+          (.catch (fn [error]
+                    (js/console.error "Could not save image." error))))
+      (download-url! (str "data:image/png;base64," base64) default-name))))
+
+(declare save-qasm!)
+(declare mark-saved!)
+
+(defn- save-json! [state]
+  (let [api (.-electronAPI js/window)]
+    (if (and api
+             (not (.-saveFile api))
+             (.-saveQasm api))
+      (save-qasm! state)
+      (save-text! (persist/to-json @state) "circuit.json"
+                  [{:name "QCAD circuit" :extensions ["json"]}]
+                  #(mark-saved! state)))))
 
 (defn- save-qasm! [state]
   (let [api (.-electronAPI js/window)]
-    (if-let [save (and api (.-saveQasm api))]
-      (.catch (.saveQasm api (qasm/to-qasm @state) "circuit.qasm")
-              (fn [error]
-                (js/console.error "Could not save OpenQASM." error)))
-      (js/console.warn "Saving requires the Electron application."))))
+    (if-let [save-qasm (and api (.-saveQasm api))]
+      (-> (.saveQasm api (qasm/to-qasm @state) "circuit.qasm")
+          (.then (fn [^js result]
+                   (when-not (and result (.-canceled result))
+                     (mark-saved! state))))
+          (.catch (fn [error]
+                    (js/console.error "Could not save OpenQASM." error))))
+      (save-text! (qasm/to-qasm @state) "circuit.qasm"
+                  [{:name "OpenQASM" :extensions ["qasm"]}]
+                  #(mark-saved! state)))))
 
-(defn- subscribe-menu-save! [state]
-  (when-let [api (.-electronAPI js/window)]
-    (when-let [on-menu-save (.-onMenuSave api)]
-      (on-menu-save #(save-qasm! state)))))
+(defn- prepare-loaded [loaded]
+  (-> loaded
+      (assoc :history [(model/snapshot loaded)]
+             :history-index 0)
+      (model/set-baseline)))
 
-(defn- open-qasm! [state root]
-  (let [api (.-electronAPI js/window)]
-    (if-let [open (and api (.-openQasm api))]
+(defn- mark-saved! [state]
+  (swap! state model/set-baseline))
+
+(defn- load-content [state root text file-path]
+  (let [json? (or (str/ends-with? (str/lower-case (str file-path)) ".json")
+                  (str/starts-with? (str/trim (str text)) "{"))
+        clipboard (:clipboard @state)
+        loaded (if json?
+                 (persist/from-json text)
+                 (qasm/from-qasm text))]
+    (reset! state (assoc (prepare-loaded loaded) :clipboard clipboard))
+    (render! root @state)))
+
+(defn- browser-open! [accept handler]
+  (let [input (.createElement js/document "input")]
+    (set! (.-type input) "file")
+    (set! (.-accept input) accept)
+    (set! (.-onchange input)
+          (fn [_]
+            (when-let [file (aget (.-files input) 0)]
+              (let [reader (js/FileReader.)]
+                (set! (.-onload reader)
+                      #(handler (.-result reader) (.-name file)))
+                (.readAsText reader file)))))
+    (.click input)))
+
+(defn- open-document! [state root]
+  (let [api (.-electronAPI js/window)
+        filters [{:name "QCAD circuit" :extensions ["json" "qasm"]}
+                 {:name "All files" :extensions ["*"]}]
+        handle-result (fn [^js result]
+                        (when (and result
+                                   (not (.-canceled result))
+                                   (string? (.-content result)))
+                          (load-content state root (.-content result)
+                                        (.-filePath result))))]
+    (cond
+      (and api (.-openFile api))
+      (-> (.openFile api filters)
+          (.then handle-result)
+          (.catch (fn [error]
+                    (js/console.error "Could not open file." error))))
+
+      (and api (.-openQasm api))
       (-> (.openQasm api)
+          (.then handle-result)
+          (.catch (fn [error]
+                    (js/console.error "Could not open file." error))))
+
+      :else
+      (browser-open! ".json,.qasm,.qasm3"
+                     #(load-content state root %1 %2)))))
+
+(defn- open-recent! [state root file-path]
+  (let [api (.-electronAPI js/window)]
+    (when-let [open-file-at (and api (.-openFileAt api))]
+      (-> (.openFileAt api file-path)
           (.then (fn [^js result]
                    (when (and result
                               (not (.-canceled result))
                               (string? (.-content result)))
-                     (reset! state (qasm/from-qasm (.-content result)))
-                     (render! root @state))))
+                     (load-content state root (.-content result) file-path))))
           (.catch (fn [error]
-                    (js/console.error "Could not open OpenQASM." error))))
-      (js/console.warn "Opening requires the Electron application."))))
+                    (js/console.error "Could not open recent file." error)))))))
+
+(defn- subscribe-menu-save! [state]
+  (when-let [api (.-electronAPI js/window)]
+    (let [unsub-save (when-let [on-menu-save (.-onMenuSave api)]
+                       (on-menu-save #(save-json! state)))
+          unsub-qasm (when-let [on-menu-save-qasm (.-onMenuSaveQasm api)]
+                       (on-menu-save-qasm #(save-qasm! state)))]
+      (cond
+        (and unsub-save unsub-qasm) (fn [] (unsub-save) (unsub-qasm))
+        unsub-save unsub-save
+        unsub-qasm unsub-qasm
+        :else nil))))
 
 (defn- subscribe-menu-open! [state root]
   (when-let [api (.-electronAPI js/window)]
     (when-let [on-menu-open (.-onMenuOpen api)]
-      (on-menu-open #(open-qasm! state root)))))
+      (on-menu-open #(open-document! state root)))))
+
+(defn- subscribe-menu-action! [api event-name handler]
+  (when-let [subscribe (aget api event-name)]
+    (subscribe handler)))
 
 (defn- closest [event selector]
-  (some-> (.-target event) (.closest selector)))
+  (let [target (.-target event)]
+    (when (and target (fn? (.-closest target)))
+      (.closest target selector))))
+
+(defn- typing? [event]
+  (let [target (.-target event)]
+    (or (contains? #{"INPUT" "TEXTAREA" "SELECT"} (.-tagName target))
+        (.-isContentEditable target))))
+
+(defn- navigator-clipboard []
+  (when (exists? js/navigator)
+    (.-clipboard js/navigator)))
+
+(defn- write-selection-clipboard! [state]
+  (when-let [snapshot (:clipboard @state)]
+    (let [api (.-electronAPI js/window)
+          text (persist/snapshot->json snapshot)]
+      (cond
+        (and api (.-writeClipboard api))
+        (-> (.writeClipboard api text)
+            (.catch (fn [error]
+                      (js/console.error "Could not write to clipboard." error))))
+
+        (navigator-clipboard)
+        (-> (.writeText (navigator-clipboard) text)
+            (.catch (fn [error]
+                      (js/console.error "Could not write to clipboard." error))))))))
+
+(defn- read-system-clipboard! [callback]
+  (let [api (.-electronAPI js/window)]
+    (cond
+      (and api (.-readClipboard api))
+      (-> (.readClipboard api)
+          (.then (fn [text] (callback (persist/snapshot-from-json text))))
+          (.catch (fn [_] (callback nil))))
+
+      (navigator-clipboard)
+      (-> (.readText (navigator-clipboard))
+          (.then (fn [text] (callback (persist/snapshot-from-json text))))
+          (.catch (fn [_] (callback nil))))
+
+      :else
+      (callback nil))))
+
+(defn- block-payload [event]
+  (when-let [node (closest event "[data-block-template], [data-block-library]")]
+    (or (when-let [id (.getAttribute node "data-block-template")]
+          (str "template:" id))
+        (when-let [name (.getAttribute node "data-block-library")]
+          (str "library:" name)))))
 
 (defn- handle-dragstart! [event]
-  (when-let [tile (closest event "[data-component-id]")]
-    (when-let [data-transfer (.-dataTransfer event)]
-      (.setData data-transfer
-                "application/x-qcad-component"
-                (.getAttribute tile "data-component-id"))
-      (set! (.-effectAllowed data-transfer) "copy"))))
+  (when-let [data-transfer (.-dataTransfer event)]
+    (if-let [payload (block-payload event)]
+      (do
+        (.setData data-transfer "application/x-qcad-block" payload)
+        (set! (.-effectAllowed data-transfer) "copy"))
+      (when-let [tile (closest event "[data-component-id]")]
+        (.setData data-transfer
+                  "application/x-qcad-component"
+                  (.getAttribute tile "data-component-id"))
+        (set! (.-effectAllowed data-transfer) "copy")))))
 
 (defn- dragged-component-id [event]
   (some-> (.-dataTransfer event)
           (.getData "application/x-qcad-component")
           not-empty
           keyword))
+
+(defn- dragged-block [event]
+  (some-> (.-dataTransfer event)
+          (.getData "application/x-qcad-block")
+          not-empty))
+
+(defn- parse-block-payload [payload]
+  (let [[kind value] (str/split payload #":" 2)]
+    (case kind
+      "template" {:type :template :id (keyword value)}
+      "library" {:type :library :name value}
+      nil)))
 
 (defn- canvas-node [root]
   (.querySelector root "#canvas-panel"))
@@ -79,10 +310,19 @@
 (defn- handle-drop! [state root event]
   (when (closest event "#canvas-panel")
     (.preventDefault event)
-    (when-let [component-id (dragged-component-id event)]
-      (when-let [[x y] (world-point state root event)]
-        (swap! state model/handle-drop component-id x y)
-        (render! root @state)))))
+    (when-let [[x y] (world-point state root event)]
+      (if-let [block (some-> (dragged-block event) parse-block-payload)]
+        (do
+          (commit! state
+                   (fn [s]
+                     (case (:type block)
+                       :template (library/insert-block-template s (:id block) x y)
+                       :library (library/insert-block-user s (:name block) x y))))
+          (swap! state model/cancel-dialog)
+          (render! root @state))
+        (when-let [component-id (dragged-component-id event)]
+          (commit! state model/handle-drop component-id x y)
+          (render! root @state))))))
 
 (defn- handle-submit! [state root event]
   (when-let [form (closest event "form")]
@@ -91,18 +331,32 @@
       "register-form"
       (let [name (.-value (.querySelector form "#register-name"))
             qubits (.-value (.querySelector form "#register-qubits"))]
-        (swap! state model/confirm-register name qubits)
+        (commit! state model/confirm-register name qubits)
         (render! root @state))
 
       "gate-qubits-form"
-      (let [qubits (.-value (.querySelector form "#gate-qubits"))]
-        (swap! state model/confirm-gate-qubits qubits)
+      (let [qubits (.-value (.querySelector form "#gate-qubits"))
+            angle (some-> (.querySelector form "#gate-angle") .-value)
+            controls (some-> (.querySelector form "#gate-controls") .-value)]
+        (commit! state model/confirm-gate-qubits qubits angle controls)
         (render! root @state))
 
       "custom-form"
       (let [qubits (.-value (.querySelector form "#custom-qubits"))
-            qasm (.-value (.querySelector form "#custom-qasm"))]
-        (swap! state model/confirm-custom-gate qubits qasm)
+            text (.-value (.querySelector form "#custom-qasm"))]
+        (commit! state model/confirm-custom-gate qubits text)
+        (render! root @state))
+
+      "annotation-form"
+      (let [text (.-value (.querySelector form "#annotation-text"))]
+        (commit! state model/confirm-annotation text)
+        (render! root @state))
+
+      "metadata-form"
+      (let [metadata {:name (.-value (.querySelector form "#metadata-name"))
+                      :author (.-value (.querySelector form "#metadata-author"))
+                      :description (.-value (.querySelector form "#metadata-description"))}]
+        (commit! state model/confirm-metadata metadata)
         (render! root @state))
 
       nil)))
@@ -167,10 +421,17 @@
 
 (defn- handle-mousedown! [state root drag event]
   (let [button (.-button event)]
+    (when (and (or (closest event ".components-panel")
+                   (closest event ".property-panel"))
+               (:context-menu @state))
+      (swap! state model/close-context-menu)
+      (render! root @state))
     (when (and (or (zero? button) (= 1 button))
                (not (closest event ".context-menu"))
                (not (closest event ".dialog-backdrop"))
-               (not (closest event ".canvas-toolbar")))
+               (not (closest event ".app-toolbar"))
+               (not (closest event ".components-panel"))
+               (not (closest event ".property-panel")))
       (let [had-context-menu? (some? (:context-menu @state))
             clicked-id (item-id event)]
         (reset! drag nil)
@@ -205,6 +466,7 @@
                            model/close-context-menu)))
               (when-not (.-shiftKey event)
                 (reset! drag {:mode :move
+                              :before (model/snapshot @state)
                               :origins (into {}
                                              (comp (filter #(contains? (:selected @state)
                                                                        (:id %)))
@@ -223,8 +485,19 @@
           (sync-selection! root @state)
           (render! root @state))))))
 
+(defn- chrome-target? [event]
+  (boolean (or (closest event ".components-panel")
+               (closest event ".property-panel")
+               (closest event ".app-toolbar")
+               (closest event ".context-menu")
+               (closest event ".dialog-backdrop"))))
+
 (defn- handle-mousemove! [state root drag event]
-  (when-not (:dialog @state)
+  (when (and (not (:dialog @state))
+             (or (not (chrome-target? event))
+                 (:mode @drag)
+                 (:marquee @state)
+                 (:wire-draft @state)))
     (let [{:keys [mode origins start]} @drag
           client-x (.-clientX event)
           client-y (.-clientY event)
@@ -268,7 +541,8 @@
           (render! root @state))))))
 
 (defn- handle-mouseup! [state root drag event]
-  (let [draft (:wire-draft @state)
+  (let [{:keys [mode before]} @drag
+        draft (:wire-draft @state)
         finishing-wire? (some? draft)
         finishing-marquee? (some? (:marquee @state))]
     (reset! drag nil)
@@ -277,7 +551,7 @@
             finishing-wire?
             (if-let [id (item-id event)]
               (when (not= id (:from draft))
-                (swap! state model/finish-wire id (wire-end-port state event))
+                (commit! state model/finish-wire id (wire-end-port state event))
                 true)
               (when-let [p (world-point state root event)]
                 (swap! state model/add-wire-point (first p) (second p))
@@ -287,7 +561,14 @@
             (do
               (swap! state model/finish-marquee)
               true))]
+      (when (and (= :move mode)
+                 before
+                 (not= before (model/snapshot @state)))
+        (swap! state (fn [current]
+                       (model/append-history (merge current before) current))))
       (when changed?
+        (render! root @state))
+      (when (and (= :move mode) before)
         (render! root @state)))))
 
 (defn- handle-wheel! [state root event]
@@ -309,14 +590,24 @@
                       (model/open-context-menu id (.-clientX event) (.-clientY event))))
     (render! root @state)))
 
+(defn- edit-item! [state id]
+  (let [item (model/item-by-id state id)]
+    (cond
+      (contains? #{:annotation :box} (:type item))
+      (model/open-annotation-editor state id)
+
+      (= :gate (:type item))
+      (if (= :custom (:component item))
+        (model/open-custom-editor state id)
+        (model/open-gate-qubits-dialog state id))
+
+      :else state)))
+
 (defn- handle-dblclick! [state root event]
   (when (and (nil? (:dialog @state))
              (not (model/wire-tool? @state)))
     (when-let [id (item-id event)]
-      (swap! state (fn [current]
-                     (if (= :custom (:component (model/item-by-id current id)))
-                       (model/open-custom-editor current id)
-                       (model/open-gate-qubits-dialog current id))))
+      (swap! state edit-item! id)
       (render! root @state))))
 
 (defn- shortcut-targets [state]
@@ -325,7 +616,7 @@
     (:selected state)))
 
 (defn- delete-targets! [state root item-ids]
-  (swap! state model/delete-items item-ids)
+  (commit! state model/delete-items item-ids)
   (render! root @state))
 
 (defn- rotate-targets! [state root item-ids degrees]
@@ -334,16 +625,49 @@
                     model/close-context-menu))
   (render! root @state))
 
+(defn- fit-view! [state root]
+  (let [panel (canvas-node root)]
+    (swap! state model/fit-view
+           (if panel (.-clientWidth panel) 800)
+           (if panel (.-clientHeight panel) 600)))
+  (render! root @state))
+
+(defn- undo! [state root]
+  (swap! state model/undo)
+  (render! root @state))
+
+(defn- redo! [state root]
+  (swap! state model/redo)
+  (render! root @state))
+
+(defn- copy! [state root]
+  (swap! state model/copy-selection)
+  (write-selection-clipboard! state)
+  (render! root @state))
+
+(defn- paste! [state root]
+  (read-system-clipboard!
+   (fn [snapshot]
+     (commit! state (fn [s]
+                      (if snapshot
+                        (model/paste-snapshot s snapshot 20 20)
+                        (model/paste-clipboard s 20 20))))
+     (render! root @state))))
+
 (defn- handle-keydown! [state root event]
   (let [key (.-key event)
         current @state
-        targets (shortcut-targets current)]
+        targets (shortcut-targets current)
+        modifier? (or (.-ctrlKey event) (.-metaKey event))
+        typing (typing? event)]
     (cond
       (and (= key "Escape") (:dialog current))
       (do
         (.preventDefault event)
         (swap! state model/cancel-dialog)
         (render! root @state))
+
+      typing nil
 
       (and (= key "Escape") (model/wire-tool? current))
       (do
@@ -364,6 +688,34 @@
         (.preventDefault event)
         (delete-targets! state root targets))
 
+      (and modifier? (= (str/lower-case key) "z") (not (.-shiftKey event)))
+      (do
+        (.preventDefault event)
+        (undo! state root))
+
+      (and modifier?
+           (or (and (= (str/lower-case key) "z") (.-shiftKey event))
+               (= (str/lower-case key) "y")))
+      (do
+        (.preventDefault event)
+        (redo! state root))
+
+      (and modifier? (= (str/lower-case key) "c"))
+      (do
+        (.preventDefault event)
+        (copy! state root))
+
+      (and modifier? (= (str/lower-case key) "v"))
+      (do
+        (.preventDefault event)
+        (paste! state root))
+
+      (and modifier? (= (str/lower-case key) "d"))
+      (do
+        (.preventDefault event)
+        (commit! state model/duplicate-selection)
+        (render! root @state))
+
       (and (or (= key "g") (= key "G"))
            (nil? (:dialog current)))
       (do
@@ -371,12 +723,21 @@
         (swap! state model/toggle-snap)
         (render! root @state))
 
-      (and (= key "0")
+      (and (or (= key "a") (= key "A"))
            (nil? (:dialog current)))
       (do
         (.preventDefault event)
-        (swap! state model/reset-view)
+        (swap! state model/toggle-component-snap)
         (render! root @state))
+
+      (and (or (= key "0") (= key "f") (= key "F"))
+           (nil? (:dialog current)))
+      (do
+        (.preventDefault event)
+        (if (= key "0")
+          (do (swap! state model/reset-view)
+              (render! root @state))
+          (fit-view! state root)))
 
       (and (or (= key "w") (= key "W"))
            (nil? (:dialog current)))
@@ -390,49 +751,268 @@
            (seq targets))
       (do
         (.preventDefault event)
-        (rotate-targets! state root targets model/rotation-step-degrees)))))
+        (rotate-targets! state root targets model/rotation-step-degrees))
+
+      (and (or (= key "Delete") (= key "Backspace"))
+           (seq targets))
+      (do
+        (.preventDefault event)
+        (delete-targets! state root targets)))))
 
 (defn- rotate-context-item! [state root]
   (when-let [{:keys [item-id]} (:context-menu @state)]
     (rotate-targets! state root #{item-id} model/rotation-step-degrees)))
 
-(defn- handle-click! [state root event]
+(defn- toggle-context-control! [state root]
+  (when-let [{:keys [item-id]} (:context-menu @state)]
+    (commit! state model/toggle-gate-control item-id)
+    (swap! state model/close-context-menu)
+    (render! root @state)))
+
+(defn- export-svg! [state format transparent include-ui scale]
+  (let [svg (export/to-svg @state {:transparent transparent
+                                   :include-ui include-ui})
+        scale (max 1 (or scale 1))]
+    (if (= "png" format)
+      (let [image (js/Image.)
+            url (export/to-data-url svg)]
+        (set! (.-onload image)
+              (fn [_]
+                (let [canvas (.createElement js/document "canvas")
+                      width (max 1 (* scale (.-naturalWidth image)))
+                      height (max 1 (* scale (.-naturalHeight image)))
+                      context (.getContext canvas "2d")]
+                  (set! (.-width canvas) width)
+                  (set! (.-height canvas) height)
+                  (.drawImage context image 0 0 width height)
+                  (let [data-url (.toDataURL canvas "image/png")
+                        base64 (second (str/split data-url #","))]
+                    (save-binary! base64 "circuit.png"
+                                  [{:name "PNG image" :extensions ["png"]}])))))
+        (set! (.-onerror image)
+              (fn [_] (js/console.error "Could not render PNG export.")))
+        (set! (.-src image) url))
+      (save-text! svg "circuit.svg"
+                  [{:name "SVG image" :extensions ["svg"]}]))))
+
+(defn- open-diff! [state]
+  (let [baseline (or (:baseline @state)
+                     (model/snapshot model/initial-state))
+        diff (persist/diff-summary baseline (model/snapshot @state))]
+    (swap! state model/open-diff-dialog diff)))
+
+(defn- insert-template! [state root id]
+  (commit! state library/insert-template id)
+  (swap! state model/cancel-dialog)
+  (render! root @state))
+
+(defn- insert-user-circuit! [state root name]
+  (commit! state library/insert-user-circuit name)
+  (swap! state model/cancel-dialog)
+  (render! root @state))
+
+(defn- save-library-circuit! [state root]
+  (let [name-input (.querySelector root "#library-name")]
+    (if (and name-input (not (str/blank? (.-value name-input))))
+      (do
+        (library/save-user-circuit! (.-value name-input) @state)
+        (render! root @state))
+      (do
+        (swap! state assoc-in [:dialog :error] "Enter a name for the circuit.")
+        (render! root @state)))))
+
+(defn- delete-library-circuit! [state root name]
+  (library/delete-user-circuit! name)
+  (render! root @state))
+
+(defn- handle-input! [state root event]
   (cond
-    (closest event "#wire-tool")
-    (do
-      (swap! state #(-> %
-                        model/toggle-wire-tool
-                        model/close-context-menu))
-      (render! root @state))
+    (closest event "#component-search")
+    (when-let [input (closest event "#component-search")]
+      (swap! state model/set-component-search (.-value input))
+      (render! root @state)
+      (when-let [next-input (.querySelector root "#component-search")]
+        (.focus next-input)
+        (let [length (count (.-value next-input))]
+          (.setSelectionRange next-input length length))))
 
-    (closest event "#snap-toggle")
-    (do
-      (swap! state model/toggle-snap)
-      (render! root @state))
+    (closest event "#library-name")
+    (swap! state assoc-in [:dialog :name]
+           (.-value (closest event "#library-name")))
 
-    (or (closest event "#register-cancel")
-        (closest event "#gate-qubits-cancel")
-        (closest event "#custom-cancel"))
-    (do
-      (swap! state model/cancel-dialog)
-      (render! root @state))
+    :else nil))
 
-    (closest event "#context-delete")
-    (when-let [{:keys [item-id]} (:context-menu @state)]
-      (delete-targets! state root #{item-id}))
+(defn- handle-change! [state root event]
+  (let [export-dialog? (= :export (get-in @state [:dialog :type]))]
+    (cond
+      (closest event "#grid-size-select")
+      (do
+        (swap! state model/set-snap-size
+               (js/parseInt (.-value (closest event "#grid-size-select")) 10))
+        (render! root @state))
 
-    (closest event "#context-rotate")
-    (rotate-context-item! state root)))
+      (and export-dialog? (closest event "#export-format"))
+      (do
+        (swap! state assoc-in [:dialog :format]
+               (.-value (closest event "#export-format")))
+        (render! root @state))
+
+      (and export-dialog? (closest event "#export-scale"))
+      (do
+        (swap! state assoc-in [:dialog :scale]
+               (js/parseInt (.-value (closest event "#export-scale")) 10))
+        (render! root @state))
+
+      (and export-dialog? (closest event "#export-transparent"))
+      (do
+        (swap! state assoc-in [:dialog :transparent]
+               (.-checked (closest event "#export-transparent")))
+        (render! root @state))
+
+      (and export-dialog? (closest event "#export-include-ui"))
+      (do
+        (swap! state assoc-in [:dialog :include-ui]
+               (.-checked (closest event "#export-include-ui")))
+        (render! root @state))
+
+      :else nil)))
+
+(defn- handle-click! [state root event]
+  (let [current @state]
+    (cond
+      (closest event "#wire-tool")
+      (do
+        (swap! state #(-> %
+                          model/toggle-wire-tool
+                          model/close-context-menu))
+        (render! root @state))
+
+      (closest event "#snap-toggle")
+      (do
+        (swap! state model/toggle-snap)
+        (render! root @state))
+
+      (closest event "#component-snap-toggle")
+      (do
+        (swap! state model/toggle-component-snap)
+        (render! root @state))
+
+      (closest event "#undo-button")
+      (undo! state root)
+
+      (closest event "#redo-button")
+      (redo! state root)
+
+      (closest event "#zoom-fit")
+      (fit-view! state root)
+
+      (closest event "#library-button")
+      (do (swap! state model/open-library-dialog)
+          (render! root @state))
+
+      (closest event "#export-button")
+      (do (swap! state model/open-export-dialog)
+          (render! root @state))
+
+      (closest event "#properties-button")
+      (do (swap! state model/open-metadata-dialog)
+          (render! root @state))
+
+      (closest event "#diff-button")
+      (do (open-diff! state)
+          (render! root @state))
+
+      (closest event "#theme-toggle")
+      (do (swap! state model/toggle-theme)
+          (render! root @state))
+
+      (or (closest event "#register-cancel")
+          (closest event "#gate-qubits-cancel")
+          (closest event "#custom-cancel")
+          (closest event "#annotation-cancel")
+          (closest event "#metadata-cancel")
+          (closest event "#export-cancel")
+          (closest event "#library-cancel")
+          (closest event "#diff-close"))
+      (do
+        (swap! state model/cancel-dialog)
+        (render! root @state))
+
+      (closest event "#context-delete")
+      (when-let [{:keys [item-id]} (:context-menu current)]
+        (delete-targets! state root #{item-id}))
+
+      (closest event "#context-rotate")
+      (rotate-context-item! state root)
+
+      (closest event "#context-control")
+      (toggle-context-control! state root)
+
+      (closest event "#property-edit")
+      (when-let [id (first (:selected current))]
+        (swap! state edit-item! id)
+        (render! root @state))
+
+      (closest event "[data-template-id]")
+      (when-let [node (closest event "[data-template-id]")]
+        (insert-template! state root
+                          (keyword (.getAttribute node "data-template-id"))))
+
+      (closest event "[data-library-name]")
+      (when-let [node (closest event "[data-library-name]")]
+        (insert-user-circuit! state root (.getAttribute node "data-library-name")))
+
+      (closest event "[data-library-delete]")
+      (when-let [node (closest event "[data-library-delete]")]
+        (delete-library-circuit! state root (.getAttribute node "data-library-delete")))
+
+      (closest event "#library-save")
+      (save-library-circuit! state root)
+
+      (closest event "#export-confirm")
+      (do
+        (when-let [dialog (:dialog current)]
+          (let [scale-select (.querySelector root "#export-scale")
+                scale (when scale-select (js/parseInt (.-value scale-select) 10))]
+            (export-svg! state (:format dialog) (:transparent dialog)
+                         (:include-ui dialog) scale)))
+        (swap! state model/cancel-dialog)
+        (render! root @state))
+
+      (closest event ".button-preset")
+      (when-let [node (closest event ".button-preset")]
+        (when-let [input (.querySelector root "#gate-angle")]
+          (set! (.-value input) (.getAttribute node "data-angle"))))
+
+      :else nil)))
 
 (defn- attach-events! [root state]
   (let [drag (atom nil)
+        api (.-electronAPI js/window)
         unsubscribe-menu-save! (subscribe-menu-save! state)
         unsubscribe-menu-open! (subscribe-menu-open! state root)
+        unsubscribes (when api
+                       [(when-let [f (subscribe-menu-action!
+                                      api "onMenuExport"
+                                      #(do (swap! state model/open-export-dialog)
+                                           (render! root @state)))]
+                          f)
+                        (when-let [f (subscribe-menu-action!
+                                      api "onMenuLibrary"
+                                      #(do (swap! state model/open-library-dialog)
+                                           (render! root @state)))]
+                          f)
+                        (when-let [f (subscribe-menu-action!
+                                      api "onMenuOpenRecent"
+                                      #(open-recent! state root %))]
+                          f)])
         root-handlers {:dragstart handle-dragstart!
                        :dragover handle-dragover!
                        :drop #(handle-drop! state root %)
                        :submit #(handle-submit! state root %)
                        :click #(handle-click! state root %)
+                       :input #(handle-input! state root %)
+                       :change #(handle-change! state root %)
                        :dblclick #(handle-dblclick! state root %)
                        :wheel #(handle-wheel! state root %)
                        :mousedown #(handle-mousedown! state root drag %)
@@ -453,11 +1033,14 @@
               (when unsubscribe-menu-save!
                 (unsubscribe-menu-save!))
               (when unsubscribe-menu-open!
-                (unsubscribe-menu-open!)))}))
+                (unsubscribe-menu-open!))
+              (doseq [unsubscribe (keep identity unsubscribes)]
+                (unsubscribe)))})) 
 
 (defn init! []
   (when-let [root (.getElementById js/document "app")]
-    (let [state (atom model/initial-state)
+    (let [restored (when (autosave-enabled?) (persist/load-autosave))
+          state (atom (prepare-loaded (or restored model/initial-state)))
           {:keys [stop!]} (attach-events! root state)]
       (render! root @state)
       {:root root

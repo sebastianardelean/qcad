@@ -8,9 +8,10 @@
     (is (= :register (:kind (first components/components)))))
 
   (testing "all required gates are present in the specified order"
-    (is (= [:h :x :y :z :s :t :sdag :tdag :rx :ry :rz :p :i]
+    (is (= [:h :x :y :z :s :t :sdag :tdag :rx :ry :rz :p :i
+            :cx :cz :swap :ccx :measure :reset :barrier]
            (mapv :id (filter #(= :gate (:kind %)) components/components))))
-    (is (= 15 (count components/components))))
+    (is (= 25 (count components/components))))
 
   (testing "a custom gate component is available"
     (is (= {:id :custom :label "Custom" :kind :custom}
@@ -24,3 +25,11 @@
 
   (testing "unknown components are not found"
     (is (nil? (components/by-id :does-not-exist)))))
+
+(deftest predicates-test
+  (is (false? (components/classical? :h)))
+  (is (true? (components/classical? :classical-register)))
+  (is (true? (components/multi-qubit? :cx)))
+  (is (true? (components/multi-qubit? :ccx)))
+  (is (false? (components/multi-qubit? :h)))
+  (is (false? (components/classical? :missing))))

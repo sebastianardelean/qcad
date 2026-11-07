@@ -63,3 +63,4 @@ pair register_1[0];
 32. ~~Add the option in toolbar File->Open, to open qasm file. When opened a qasm file, it shall draw the circuit automatically on the circuit.~~
 33. ~~When scrolling down to select a component, the scroll automatically jumps up.~~
 34. ~~20 px drop-down select doesn't work.~~
+35. ~~Make Box resizable.~~

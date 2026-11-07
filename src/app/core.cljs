@@ -447,6 +447,19 @@
             (reset! drag {:mode :pan
                           :start [(.-clientX event) (.-clientY event)]}))
 
+          (closest event ".box-resize-handle")
+          (do
+            (.preventDefault event)
+            (when-let [id (item-id event)]
+              (when-let [item (model/item-by-id @state id)]
+                (when-let [p (world-point state root event)]
+                  (reset! drag {:mode :resize
+                                :resize-id id
+                                :before (model/snapshot @state)
+                                :start p
+                                :width (or (:width item) 220)
+                                :height (or (:height item) 140)})))))
+
           (model/wire-tool? @state)
           (if clicked-id
             (when-let [p (world-point state root event)]
@@ -503,7 +516,7 @@
                  (:mode @drag)
                  (:marquee @state)
                  (:wire-draft @state)))
-    (let [{:keys [mode origins start]} @drag
+    (let [{:keys [mode origins start resize-id width height]} @drag
           client-x (.-clientX event)
           client-y (.-clientY event)
           p (world-point state root event)]
@@ -540,6 +553,14 @@
             (swap! state model/set-cursor p))
           (render! root @state))
 
+        (= :resize mode)
+        (when p
+          (swap! state model/resize-box
+                 resize-id
+                 (+ width (- (first p) (first start)))
+                 (+ height (- (second p) (second start))))
+          (render! root @state))
+
         :else
         (when p
           (swap! state model/set-cursor p)
@@ -566,14 +587,14 @@
             (do
               (swap! state model/finish-marquee)
               true))]
-      (when (and (= :move mode)
+      (when (and (contains? #{:move :resize} mode)
                  before
                  (not= before (model/snapshot @state)))
         (swap! state (fn [current]
                        (model/append-history (merge current before) current))))
       (when changed?
         (render! root @state))
-      (when (and (= :move mode) before)
+      (when (and (contains? #{:move :resize} mode) before)
         (render! root @state)))))
 
 (defn- handle-wheel! [state root event]

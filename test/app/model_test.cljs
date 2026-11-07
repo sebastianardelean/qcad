@@ -1398,3 +1398,20 @@
       (is (= [] (:wires state)))
       (is (nil? (:wire-draft state)))
       (is (= 3 (count (:items state)))))))
+
+(deftest resize-box-test
+  (testing "boxes resize and respect the minimum size"
+    (let [state (-> model/initial-state
+                    (model/handle-drop :box 10 20))
+          resized (model/resize-box state 1 340 220)
+          clamped (model/resize-box state 1 10 5)]
+      (is (= [340 220] ((juxt :width :height) (first (:items resized)))))
+      (is (= [80 60] ((juxt :width :height) (first (:items clamped)))))
+      (is (= [220 140] ((juxt :width :height) (first (:items state)))))))
+
+  (testing "non-box items and unknown ids are left alone"
+    (let [state (-> model/initial-state
+                    (model/handle-drop :h 0 0))]
+      (is (= state (model/resize-box state 1 300 300)))
+      (is (= state (model/resize-box state 99 300 300))))))
+

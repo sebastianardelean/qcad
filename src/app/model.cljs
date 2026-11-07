@@ -241,6 +241,22 @@
                        item))
                    items)))))
 
+(def min-box-width 80)
+(def min-box-height 60)
+
+(defn resize-box [state item-id width height]
+  (if (and (number? width) (number? height))
+    (update state :items
+            (fn [items]
+              (mapv (fn [item]
+                      (if (and (= item-id (:id item)) (= :box (:type item)))
+                        (assoc item
+                               :width (max min-box-width width)
+                               :height (max min-box-height height))
+                        item))
+                    items)))
+    state))
+
 (defn item-by-id [state item-id]
   (first (filter #(= item-id (:id %)) (:items state))))
 

@@ -1740,3 +1740,17 @@
         (define-property! port-node "offsetHeight" 8))
       (dom/refresh-wires! node state)
       (is (= 2 (count (array-seq (.querySelectorAll node ".canvas-wire"))))))))
+
+(deftest box-resize-test
+  (testing "dragging the box handle resizes the box"
+    (drop-component! :box 200 200)
+    (let [box (select ".canvas-box")
+          handle (select ".canvas-box .box-resize-handle")]
+      (is (some? handle))
+      (is (= "220px" (.. box -style -width)))
+      (mouse-down! handle {:clientX 400 :clientY 300})
+      (mouse-move! {:clientX 500 :clientY 380})
+      (mouse-up!)
+      (let [resized (select ".canvas-box")]
+        (is (= "320px" (.. resized -style -width)))
+        (is (= "220px" (.. resized -style -height)))))))

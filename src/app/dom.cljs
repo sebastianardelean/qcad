@@ -248,7 +248,9 @@
                             :style (merge (item-style item)
                                           {:width (str (or (:width item) 220) "px")
                                            :height (str (or (:height item) 140) "px")})})]
-        (append! node [(el "span" {:class "item-label box-label" :text text})])
+        (append! node [(el "span" {:class "item-label box-label" :text text})
+                       (el "span" {:class "box-resize-handle"
+                                   :attrs {:title "Resize"}})])
         node)
 
       nil)))

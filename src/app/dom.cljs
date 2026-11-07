@@ -490,7 +490,9 @@
 
 (defn- render-error [errors]
   (el "p" {:class "dialog-error"
-           :text (str/join " " (vals errors))
+           :text (if (map? errors)
+                   (str/join " " (vals errors))
+                   (str errors))
            :attrs {:role "alert"}}))
 
 (defn- dialog-backdrop [title-id form]

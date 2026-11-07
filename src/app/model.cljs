@@ -292,12 +292,16 @@
   (boolean (:classical item)))
 
 (defn port-count [item kind]
-  (case (:type item)
-    :register (if (classical-register? item)
-                (if (= :input kind) (or (:qubits item) 0) 0)
-                (if (= :output kind) (or (:qubits item) 0) 0))
-    :gate (if (contains? #{:input :output} kind) (gate-port-count item) 0)
-    0))
+  (cond
+    (= :register (:type item))
+    (if (classical-register? item)
+      (if (= :input kind) (or (:qubits item) 0) 0)
+      (if (= :output kind) (or (:qubits item) 0) 0))
+
+    (= :gate (:type item))
+    (if (contains? #{:input :output} kind) (gate-port-count item) 0)
+
+    :else 0))
 
 (defn port-used? [state item-id kind index]
   (boolean
@@ -667,17 +671,17 @@
 (defn open-gate-qubits-dialog [state gate-id]
   (if-let [gate (item-by-id state gate-id)]
     (if (= :gate (:type gate))
-      (assoc state
-             :dialog (cond-> {:type :gate-qubits
-                              :gate-id gate-id
-                              :qubits (str (gate-target-count gate))
-                              :error nil}
-                       (components/parameterized? (:component gate))
-                       (assoc :angle (or (:angle gate) default-angle))
-
-                       (pos? (gate-control-count gate))
-                       (assoc :controls (str (gate-control-count gate))))
-             :context-menu nil)
+      (let [dialog {:type :gate-qubits
+                    :gate-id gate-id
+                    :qubits (str (gate-target-count gate))
+                    :error nil}
+            dialog (if (components/parameterized? (:component gate))
+                     (assoc dialog :angle (or (:angle gate) default-angle))
+                     dialog)
+            dialog (if (pos? (gate-control-count gate))
+                     (assoc dialog :controls (str (gate-control-count gate)))
+                     dialog)]
+        (assoc state :dialog dialog :context-menu nil))
       state)
     state))
 
@@ -696,8 +700,7 @@
 
 (defn- update-gate-shape [state gate-id f]
   (let [gate (item-by-id state gate-id)
-        updated (f gate)
-        ports (gate-port-count updated)]
+        updated (f gate)]
     (-> state
         (update :items
                 (fn [items]
@@ -708,9 +711,11 @@
                         items)))
         (update :wires
                 (fn [wires]
-                  (filterv #(not (wire-overflows? gate-id ports %)) wires)))
+                  (filterv #(not (wire-overflows? gate-id (gate-port-count updated) %))
+                           wires)))
         (cond-> (and (:wire-draft state)
-                     (draft-overflows? (:wire-draft state) gate-id ports))
+                     (draft-overflows? (:wire-draft state) gate-id
+                                       (gate-port-count updated)))
           (assoc :wire-draft nil)))))
 
 (defn- update-gate-qubits [state gate-id qubits]
@@ -730,8 +735,8 @@
     state))
 
 (defn- parse-controls [value]
-  (let [text (some-> value str str/trim)]
-    (if (re-matches #"[0-9]+" (or text ""))
+  (let [text (str/trim (str (or value "")))]
+    (if (re-matches #"[0-9]+" text)
       (js/parseInt text 10)
       0)))
 

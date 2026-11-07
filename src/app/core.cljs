@@ -315,9 +315,14 @@
         (do
           (commit! state
                    (fn [s]
-                     (case (:type block)
-                       :template (library/insert-block-template s (:id block) x y)
-                       :library (library/insert-block-user s (:name block) x y))))
+                     (cond
+                       (= :template (:type block))
+                       (library/insert-block-template s (:id block) x y)
+
+                       (= :library (:type block))
+                       (library/insert-block-user s (:name block) x y)
+
+                       :else s)))
           (swap! state model/cancel-dialog)
           (render! root @state))
         (when-let [component-id (dragged-component-id event)]
@@ -327,39 +332,39 @@
 (defn- handle-submit! [state root event]
   (when-let [form (closest event "form")]
     (.preventDefault event)
-    (case (.-id form)
-      "register-form"
+    (cond
+      (= "register-form" (.-id form))
       (let [name (.-value (.querySelector form "#register-name"))
             qubits (.-value (.querySelector form "#register-qubits"))]
         (commit! state model/confirm-register name qubits)
         (render! root @state))
 
-      "gate-qubits-form"
+      (= "gate-qubits-form" (.-id form))
       (let [qubits (.-value (.querySelector form "#gate-qubits"))
             angle (some-> (.querySelector form "#gate-angle") .-value)
             controls (some-> (.querySelector form "#gate-controls") .-value)]
         (commit! state model/confirm-gate-qubits qubits angle controls)
         (render! root @state))
 
-      "custom-form"
+      (= "custom-form" (.-id form))
       (let [qubits (.-value (.querySelector form "#custom-qubits"))
             text (.-value (.querySelector form "#custom-qasm"))]
         (commit! state model/confirm-custom-gate qubits text)
         (render! root @state))
 
-      "annotation-form"
+      (= "annotation-form" (.-id form))
       (let [text (.-value (.querySelector form "#annotation-text"))]
         (commit! state model/confirm-annotation text)
         (render! root @state))
 
-      "metadata-form"
+      (= "metadata-form" (.-id form))
       (let [metadata {:name (.-value (.querySelector form "#metadata-name"))
                       :author (.-value (.querySelector form "#metadata-author"))
                       :description (.-value (.querySelector form "#metadata-description"))}]
         (commit! state model/confirm-metadata metadata)
         (render! root @state))
 
-      nil)))
+      :else nil)))
 
 (defn- item-id [event]
   (some-> (closest event "[data-item-id]")

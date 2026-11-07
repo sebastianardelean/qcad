@@ -2,6 +2,7 @@
   (:require [clojure.string :as str]
             [cljs.test :refer [deftest is testing use-fixtures]]
             [app.core :as core]
+            [app.dom :as dom]
             ["jsdom" :as jsdom]))
 
 (defonce ^:private dom
@@ -1431,3 +1432,311 @@
       (change! (select "#grid-size-select"))
       (is (= "20" (.-value (select "#grid-size-select"))))
       (is (= "Grid 20" (status-text "#grid-size"))))))
+
+(defn- define-property! [target name value]
+  (js/Object.defineProperty target name
+                            #js {:configurable true
+                                 :writable true
+                                 :value value}))
+
+(defn- capture-anchor-clicks! []
+  (let [clicks (atom [])
+        prototype (.-prototype (.-HTMLAnchorElement js/window))
+        original (.-click prototype)]
+    (define-property! prototype "click"
+                      (fn []
+                        (this-as node
+                          (swap! clicks conj [(.-href node)
+                                              (.-download node)]))))
+    {:clicks clicks
+     :restore! (fn [] (define-property! prototype "click" original))}))
+
+(defn- rejecting-thenable [error]
+  #js {:then (fn [_] (rejecting-thenable error))
+       :catch (fn [callback] (callback error) (rejecting-thenable error))})
+
+(deftest browser-save-fallback-test
+  (testing "SVG export downloads a data URL when Electron is unavailable"
+    (let [{:keys [clicks restore!]} (capture-anchor-clicks!)]
+      (try
+        (drop-component! :h 100 100)
+        (.click (select "#export-button"))
+        (change! (select "#export-format"))
+        (change! (select "#export-scale"))
+        (.click (select "#export-confirm"))
+        (let [[href name] (first @clicks)]
+          (is (= "circuit.svg" name))
+          (is (str/starts-with? href "data:text/plain")))
+        (finally (restore!))))))
+
+(deftest menu-save-browser-fallback-test
+  (testing "the save menu publishes a JSON download without Electron saving"
+    (let [callbacks (atom {})
+          api #js {:onMenuSave (fn [callback]
+                                (swap! callbacks assoc :save callback)
+                                (fn [] nil))}
+          {:keys [clicks restore!]} (capture-anchor-clicks!)]
+      (try
+        (reset-app-with-api! api)
+        (drop-component! :h 100 100)
+        ((:save @callbacks))
+        (let [[href name] (first @clicks)]
+          (is (= "circuit.json" name))
+          (is (str/starts-with? href "data:text/plain")))
+        (finally (restore!))))))
+
+(defn- fake-image []
+  (let [image #js {:naturalWidth 120 :naturalHeight 60}]
+    (js/Object.defineProperty
+     image "src"
+     #js {:configurable true
+          :set (fn [_]
+                 (when-let [onload (.-onload image)]
+                   (onload nil)))})
+    image))
+
+(deftest png-export-fallback-test
+  (testing "PNG export draws on a canvas and downloads the encoded image"
+    (let [{:keys [clicks restore!]} (capture-anchor-clicks!)
+          original-image (.-Image js/globalThis)
+          prototype (.-prototype (.-HTMLCanvasElement js/window))
+          original-get-context (.-getContext prototype)
+          original-to-data-url (.-toDataURL prototype)]
+      (try
+        (set! (.-Image js/globalThis) (fn [] (fake-image)))
+        (define-property! prototype "getContext"
+                          (fn [_ _] #js {:drawImage (fn [& _] nil)}))
+        (define-property! prototype "toDataURL"
+                          (fn [_ _] "data:image/png;base64,QUJD"))
+        (drop-component! :h 100 100)
+        (.click (select "#export-button"))
+        (let [format (select "#export-format")]
+          (set! (.-value format) "png")
+          (change! format))
+        (let [scale (select "#export-scale")]
+          (set! (.-value scale) "2")
+          (change! scale))
+        (.click (select "#export-confirm"))
+        (let [[href name] (first @clicks)]
+          (is (= "circuit.png" name))
+          (is (= "data:image/png;base64,QUJD" href)))
+        (finally
+          (set! (.-Image js/globalThis) original-image)
+          (define-property! prototype "getContext" original-get-context)
+          (define-property! prototype "toDataURL" original-to-data-url)
+          (restore!))))))
+
+(defn- fake-file-reader [content]
+  (fn []
+    (this-as this
+      (set! (.-result this) nil)
+      (set! (.-onload this) nil)
+      (set! (.-readAsText this)
+            (fn [_ _]
+              (set! (.-result this) content)
+              ((.-onload this) nil)))
+      this)))
+
+(deftest browser-open-fallback-test
+  (testing "the open menu loads a file through the browser file input"
+    (let [callbacks (atom {})
+          api #js {:onMenuOpen (fn [callback]
+                                (swap! callbacks assoc :open callback)
+                                (fn [] nil))}
+          selected (atom nil)
+          prototype (.-prototype (.-HTMLInputElement js/window))
+          original-click (.-click prototype)
+          original-reader (.-FileReader js/globalThis)]
+      (try
+        (set! (.-FileReader js/globalThis)
+              (fake-file-reader (str "OPENQASM 3.0;\n"
+                                     "qubit[1] q;\n"
+                                     "h q[0];\n")))
+        (define-property! prototype "click"
+                          (fn [] (this-as node (reset! selected node))))
+        (reset-app-with-api! api)
+        ((:open @callbacks))
+        (let [input @selected]
+          (is (some? input))
+          (define-property! input "files" #js [#js {:name "demo.qasm"}])
+          ((.-onchange input) nil))
+        (is (= "q (1 qubit)" (.-textContent (select ".canvas-register"))))
+        (is (= "H" (.-textContent (select ".canvas-gate"))))
+        (finally
+          (set! (.-FileReader js/globalThis) original-reader)
+          (define-property! prototype "click" original-click))))))
+
+(deftest open-error-test
+  (testing "file open failures are logged without changing the circuit"
+    (let [callbacks (atom {})
+          errors (atom [])
+          original-error (.-error js/console)
+          api #js {:onMenuOpen (fn [callback]
+                                (swap! callbacks assoc :open callback)
+                                (fn [] nil))
+                   :onMenuOpenRecent (fn [callback]
+                                       (swap! callbacks assoc :recent callback)
+                                       (fn [] nil))
+                   :openFile (fn [_]
+                               (rejecting-thenable (js/Error. "open failed")))
+                   :openFileAt (fn [_]
+                                 (rejecting-thenable
+                                  (js/Error. "recent failed")))}]
+      (try
+        (set! (.-error js/console)
+              (fn [message _] (swap! errors conj message)))
+        (reset-app-with-api! api)
+        ((:open @callbacks))
+        (is (some #(str/includes? % "Could not open file.") @errors))
+        ((:recent @callbacks) "missing.qasm")
+        (is (some #(str/includes? % "Could not open recent file.") @errors))
+        (is (= 0 (count (select-all ".canvas-register"))))
+        (finally (set! (.-error js/console) original-error))))))
+
+(deftest menu-save-variants-test
+  (testing "both save menu events are subscribed and unsubscribed"
+    (let [events (atom [])
+          api #js {:onMenuSave (fn [_] (fn [] (swap! events conj :save)))
+                   :onMenuSaveQasm (fn [_] (fn [] (swap! events conj :qasm)))}]
+      (reset-app-with-api! api)
+      (stop-app!)
+      (is (= #{:save :qasm} (set @events)))))
+
+  (testing "a save callback without its OpenQASM counterpart still works"
+    (reset-app!)
+    (let [events (atom [])
+          api #js {:onMenuSave (fn [_] (fn [] (swap! events conj :save)))}]
+      (reset-app-with-api! api)
+      (stop-app!)
+      (is (= [:save] @events))))
+
+  (testing "an OpenQASM save callback alone still works"
+    (reset-app!)
+    (let [events (atom [])
+          api #js {:onMenuSaveQasm (fn [_] (fn [] (swap! events conj :qasm)))}]
+      (reset-app-with-api! api)
+      (stop-app!)
+      (is (= [:qasm] @events)))))
+
+(deftest navigator-clipboard-test
+  (testing "copy and paste use the asynchronous browser clipboard"
+    (let [clipboard (atom "")
+          navigator-object (.-navigator js/window)
+          original-navigator (.-navigator js/globalThis)
+          original (.-clipboard navigator-object)]
+      (try
+        (js/Object.defineProperty
+         navigator-object "clipboard"
+         #js {:configurable true
+              :value #js {:writeText (fn [text]
+                                      (reset! clipboard text)
+                                      (thenable nil))
+                          :readText (fn [] (thenable @clipboard))}})
+        (define-property! js/globalThis "navigator" navigator-object)
+        (reset-app!)
+        (drop-component! :h 100 100)
+        (mouse-down! (select "[data-item-id=\"1\"]")
+                     {:clientX 100 :clientY 100})
+        (mouse-up!)
+        (key-down! "c" {:ctrlKey true})
+        (is (str/includes? @clipboard "\"items\""))
+        (key-down! "v" {:ctrlKey true})
+        (is (= 2 (count (select-all ".canvas-gate"))))
+        (finally
+          (define-property! js/globalThis "navigator" original-navigator)
+          (js/Object.defineProperty navigator-object "clipboard"
+                                    #js {:configurable true
+                                         :value original}))))))
+
+(deftest fit-view-test
+  (testing "fit view controls the canvas from the toolbar and keyboard"
+    (drop-component! :h 100 100)
+    (.click (select "#zoom-fit"))
+    (is (some? (select ".canvas-gate")))
+    (key-down! "f")
+    (is (some? (select ".canvas-gate")))
+    (key-down! "0")
+    (is (some? (select ".canvas-gate")))))
+
+(deftest toggle-control-context-test
+  (testing "the context menu toggles a gate control line"
+    (drop-component! :h 100 100)
+    (right-click! (select ".canvas-gate") 100 100)
+    (is (some? (select "#context-control")))
+    (.click (select "#context-control"))
+    (is (nil? (select "#context-menu")))
+    (is (= 1 (count (select-all ".canvas-control-line"))))
+    (right-click! (select ".canvas-gate") 100 100)
+    (.click (select "#context-control"))
+    (is (= 0 (count (select-all ".canvas-control-line"))))))
+
+(deftest insert-user-circuit-test
+  (testing "a saved circuit is inserted from the library list"
+    (drop-component! :h 100 100)
+    (.click (select "#library-button"))
+    (input! (select "#library-name") "")
+    (.click (select "#library-save"))
+    (is (str/includes? (.-textContent (select "#library-form"))
+                       "Enter a name for the circuit."))
+    (input! (select "#library-name") "Saved circuit")
+    (.click (select "#library-save"))
+    (is (some? (select "[data-library-name=\"Saved circuit\"]")))
+    (.click (select "[data-library-name=\"Saved circuit\"]"))
+    (is (nil? (select "#library-form")))
+    (is (= 2 (count (select-all ".canvas-gate"))))))
+
+(deftest annotation-dialog-test
+  (testing "annotations are added and edited from their dialog"
+    (drop-component! :annotation 100 100)
+    (is (some? (select "#annotation-form")))
+    (is (= "Add annotation" (.-textContent (select ".dialog-title"))))
+    (set! (.-value (select "#annotation-text")) "Note")
+    (.click (select "#annotation-confirm"))
+    (is (nil? (select "#annotation-form")))
+    (is (= "Note" (.-textContent (select ".canvas-annotation"))))
+    (double-click! (select ".canvas-annotation"))
+    (is (some? (select "#annotation-form")))
+    (is (= "Edit annotation" (.-textContent (select ".dialog-title"))))
+    (set! (.-value (select "#annotation-text")) "   ")
+    (.click (select "#annotation-confirm"))
+    (is (some? (select "#annotation-form")))
+    (is (str/includes? (.-textContent (select "#annotation-form"))
+                       "Text is required."))
+    (set! (.-value (select "#annotation-text")) "Edited")
+    (.click (select "#annotation-confirm"))
+    (is (= "Edited" (.-textContent (select ".canvas-annotation"))))))
+
+(deftest dom-edge-render-test
+  (testing "fallback labels and all item kinds render without a session"
+    (let [state (assoc @(:state @session)
+                       :items [{:id 1 :type :gate :component :mystery
+                                :x 10 :y 20}
+                               {:id 2 :type :gate :component nil
+                                :x 100 :y 20}
+                               {:id 3 :type :annotation :text "Note"
+                                :x 200 :y 20}
+                               {:id 4 :type :box :text "Box"
+                                :x 300 :y 20}]
+                       :wires [{:id 1 :from 1 :to 2}
+                               {:id 2 :from 1 :to 3
+                                :from-port {:kind :output :index 0}
+                                :to-port {:kind :input :index 0}}]
+                       :selected #{1}
+                       :context-menu nil
+                       :dialog nil)
+          node (dom/render-app state)
+          gates (vec (array-seq (.querySelectorAll node ".canvas-gate")))]
+      (is (= ["mystery" "Gate"] (mapv #(.-textContent %) gates)))
+      (is (= "Note" (.-textContent (.querySelector node ".canvas-annotation"))))
+      (is (= "Box" (.-textContent (.querySelector node ".canvas-box"))))
+      (is (= 2 (count (array-seq (.querySelectorAll node ".canvas-wire")))))
+      (set! (.-innerHTML (.-body (document))) "<div id=\"host\"></div>")
+      (.appendChild (select "#host") node)
+      (doseq [item-node (array-seq (.querySelectorAll node ".canvas-item"))]
+        (define-property! item-node "offsetWidth" 120)
+        (define-property! item-node "offsetHeight" 40))
+      (doseq [port-node (array-seq (.querySelectorAll node ".item-port"))]
+        (define-property! port-node "offsetWidth" 8)
+        (define-property! port-node "offsetHeight" 8))
+      (dom/refresh-wires! node state)
+      (is (= 2 (count (array-seq (.querySelectorAll node ".canvas-wire"))))))))

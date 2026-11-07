@@ -1329,3 +1329,72 @@
                                      100000 100000)
                      [:view :zoom])))))
 
+
+(deftest multi-arity-dispatch-test
+  (let [state (-> model/initial-state
+                  (model/add-item {:id 1 :type :gate :component :h :x 0 :y 0})
+                  (model/add-item {:id 2 :type :gate :component :x :x 100 :y 0}))]
+    (testing "apply dispatches through the variadic arity wrappers"
+      (is (some? (:wire-draft (apply model/start-wire-draft [state 1 0 0]))))
+      (is (= 1 (count (:wires (apply model/add-wire [state 1 2])))))
+      (is (some? (:wires (apply model/add-wire [state 1 2 []]))))
+      (is (= state (apply model/finish-wire [state 1])))
+      (is (= 90 (get-in (apply model/rotate-item [state 1]) [:items 0 :rotation])))
+      (is (= 45 (get-in (apply model/rotate-item [state 1 45]) [:items 0 :rotation])))
+      (is (some? (get-in (apply model/open-register-dialog [state 0 0])
+                         [:dialog :name])))
+      (is (= "1" (get-in (apply model/open-gate-qubits-dialog [state 1])
+                         [:dialog :qubits])))
+      (is (= [0 0 1]
+             ((juxt #(get-in % [:view :pan-x])
+                    #(get-in % [:view :pan-y])
+                    #(get-in % [:view :zoom]))
+              (apply model/fit-view [(assoc state :items [])])))))))
+
+(deftest snapping-and-history-edges-test
+  (testing "component snapping tolerates empty moving or static sets"
+    (let [one (assoc model/initial-state
+                     :snap false :snap-components true
+                     :items [{:id 1 :type :gate :component :h :x 0 :y 0}])]
+      (is (= [5 5] ((juxt :x :y) (first (:items (model/move-items one {1 [0 0]} 5 5))))))
+      (is (= [0 0] ((juxt :x :y) (first (:items (model/move-items one {} 5 5))))))))
+
+  (testing "history is capped at the configured limit"
+    (let [entry {:items [] :wires []}
+          before {:history (vec (repeat 100 entry)) :history-index 99}
+          capped (model/append-history before entry)]
+      (is (= model/history-limit (count (:history capped))))
+      (is (= (dec model/history-limit) (:history-index capped))))))
+
+(deftest gate-dialog-edge-branches-test
+  (testing "unwired gate inputs are traced as empty targets"
+    (let [state (-> model/initial-state
+                    (model/add-item {:id 1 :type :gate :component :h :x 0 :y 0}))]
+      (is (= [] (model/gate-targets state 1)))))
+
+  (testing "non-numeric controls reset to zero and angles are removed"
+    (let [base (-> model/initial-state
+                   (model/add-item {:id 1 :type :gate :component :rx :x 0 :y 0})
+                   (model/open-gate-qubits-dialog 1))
+          updated (apply model/confirm-gate-qubits [base "2" "" "abc"])]
+      (is (= 2 (get-in updated [:items 0 :qubits])))
+      (is (nil? (get-in updated [:items 0 :controls])))
+      (is (nil? (get-in updated [:items 0 :angle])))
+      (is (nil? (:dialog updated)))))
+
+  (testing "shrinking a wired gate drops overflowing wires and drafts"
+    (let [state (-> model/initial-state
+                    (model/add-item {:id 1 :type :gate :component :cx :qubits 2 :x 0 :y 0})
+                    (model/add-item {:id 2 :type :gate :component :h :x 100 :y 0})
+                    (model/add-item {:id 3 :type :gate :component :x :x 200 :y 0})
+                    (assoc :wires [{:id 1 :from 1 :to 2
+                                    :from-port {:kind :output :index 1}
+                                    :to-port {:kind :input :index 0}}]
+                           :wire-draft {:from 1
+                                        :from-port {:kind :output :index 1}}
+                           :dialog {:type :gate-qubits :gate-id 1
+                                    :qubits "2" :error nil})
+                    (model/confirm-gate-qubits "1"))]
+      (is (= [] (:wires state)))
+      (is (nil? (:wire-draft state)))
+      (is (= 3 (count (:items state)))))))
